@@ -11,7 +11,7 @@ pip install -r requirements.txt
 ## 2. 起動
 
 ```bash
-python wsgi.py
+uvicorn wsgi:app --host 0.0.0.0 --port $PORT
 ```
 
 - WebSocket endpoint (Render): `wss://jongpire.onrender.com/ws`
