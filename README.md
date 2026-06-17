@@ -11,11 +11,11 @@ pip install -r requirements.txt
 ## 2. 起動
 
 ```bash
-gunicorn -w 1 -k gthread --threads 8 -b 0.0.0.0:$PORT wsgi:app
+python wsgi.py
 ```
 
 - WebSocket endpoint (Render): `wss://jongpire.onrender.com/ws`
-- Health check: `http://<host>:8000/healthz`
+- Health check: `https://jongpire.onrender.com/healthz`
 
 ## 3. 運用メモ
 
