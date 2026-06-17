@@ -9,6 +9,8 @@ import atexit
 import asyncio
 import concurrent.futures
 import json
+import logging
+import os
 import threading
 from typing import Any, Dict
 
@@ -16,6 +18,9 @@ from flask import Flask, jsonify
 from flask_sock import Sock
 
 from .websocket_server import WebSocketGameServer
+
+
+logger = logging.getLogger(__name__)
 
 
 class AsyncLoopThread:
@@ -51,7 +56,8 @@ class FlaskWebSocketBridge:
 
     def __init__(self, max_players: int = 2) -> None:
         self._loop_thread = AsyncLoopThread()
-        self._server = WebSocketGameServer(host="0.0.0.0", port=0, max_players=max_players)
+        port = int(os.getenv("PORT", "8000"))
+        self._server = WebSocketGameServer(host="0.0.0.0", port=port, max_players=max_players)
         self._send_locks: Dict[int, threading.Lock] = {}
         self._send_locks_guard = threading.Lock()
 
@@ -104,6 +110,7 @@ class FlaskWebSocketBridge:
         try:
             client_id = self._submit(self._server._register_client(websocket)).result()
             registered = True
+            logger.info("websocket connected: %s", client_id)
 
             self._submit(
                 self._server._send_json(
@@ -116,13 +123,17 @@ class FlaskWebSocketBridge:
                 raw_message = websocket.receive()
                 if raw_message is None:
                     break
+                if isinstance(raw_message, bytes):
+                    raw_message = raw_message.decode("utf-8", errors="ignore")
                 self._submit(self._server._handle_message(websocket, raw_message)).result()
 
         except Exception as exc:
+            logger.exception("websocket handling failed")
             if registered:
                 self._submit(self._server._send_json(websocket, {"type": "error", "message": str(exc)})).result()
         finally:
             if registered:
+                logger.info("websocket disconnected: %s", self._server._client_id_by_socket.get(websocket))
                 self._submit(self._server._unregister_client(websocket)).result()
             self._drop_send_lock(websocket)
 
@@ -138,12 +149,19 @@ def create_app() -> Flask:
     app = Flask(__name__)
     sock = Sock(app)
 
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+
     @app.get("/healthz")
     def healthz() -> Any:
         return jsonify({"status": "ok"})
 
     @sock.route("/ws")
     def websocket_endpoint(ws: Any) -> None:
+        _bridge.handle_connection(ws)
+
+    @sock.route("/")
+    def websocket_endpoint_root(ws: Any) -> None:
+        # クライアントがパス未指定で接続してきた場合の後方互換。
         _bridge.handle_connection(ws)
 
     return app
