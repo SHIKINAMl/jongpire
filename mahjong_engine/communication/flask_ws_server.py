@@ -86,15 +86,15 @@ class FlaskWebSocketBridge:
 
         text = json.dumps(payload, ensure_ascii=False)
         try:
-            await asyncio.to_thread(self._send_sync, websocket, text)
+            self._send_sync(websocket, text)
         except Exception:
-            pass
+            logger.exception("failed to send websocket payload")
 
     async def _safe_close(self, websocket: Any) -> None:
         try:
-            await asyncio.to_thread(websocket.close)
+            websocket.close()
         except Exception:
-            pass
+            logger.exception("failed to close websocket")
         finally:
             self._drop_send_lock(websocket)
 
