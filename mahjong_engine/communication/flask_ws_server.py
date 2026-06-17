@@ -11,6 +11,7 @@ import concurrent.futures
 import json
 import logging
 import os
+import queue
 import threading
 from typing import Any, Dict
 
@@ -60,6 +61,8 @@ class FlaskWebSocketBridge:
         self._server = WebSocketGameServer(host="0.0.0.0", port=port, max_players=max_players)
         self._send_locks: Dict[int, threading.Lock] = {}
         self._send_locks_guard = threading.Lock()
+        self._outboxes: Dict[int, queue.Queue[tuple[str, str]]] = {}
+        self._outboxes_guard = threading.Lock()
 
     def _get_send_lock(self, websocket: Any) -> threading.Lock:
         key = id(websocket)
@@ -75,6 +78,20 @@ class FlaskWebSocketBridge:
         with self._send_locks_guard:
             self._send_locks.pop(key, None)
 
+    def _get_outbox(self, websocket: Any) -> queue.Queue[tuple[str, str]]:
+        key = id(websocket)
+        with self._outboxes_guard:
+            outbox = self._outboxes.get(key)
+            if outbox is None:
+                outbox = queue.Queue()
+                self._outboxes[key] = outbox
+            return outbox
+
+    def _drop_outbox(self, websocket: Any) -> None:
+        key = id(websocket)
+        with self._outboxes_guard:
+            self._outboxes.pop(key, None)
+
     def _send_sync(self, websocket: Any, text: str) -> None:
         lock = self._get_send_lock(websocket)
         with lock:
@@ -86,17 +103,44 @@ class FlaskWebSocketBridge:
 
         text = json.dumps(payload, ensure_ascii=False)
         try:
-            self._send_sync(websocket, text)
+            self._get_outbox(websocket).put(("send", text))
         except Exception:
             logger.exception("failed to send websocket payload")
 
     async def _safe_close(self, websocket: Any) -> None:
         try:
-            websocket.close()
+            self._get_outbox(websocket).put(("close", ""))
         except Exception:
             logger.exception("failed to close websocket")
-        finally:
-            self._drop_send_lock(websocket)
+
+    def _flush_outbox(self, websocket: Any) -> bool:
+        """接続スレッド上で送信・クローズを実行する。戻り値 True は切断要求。"""
+        outbox = self._get_outbox(websocket)
+        should_close = False
+
+        while True:
+            try:
+                op, payload = outbox.get_nowait()
+            except queue.Empty:
+                break
+
+            if op == "close":
+                should_close = True
+                continue
+
+            try:
+                self._send_sync(websocket, payload)
+            except Exception:
+                logger.exception("failed to flush websocket payload")
+
+        if should_close:
+            try:
+                websocket.close()
+            except Exception:
+                logger.exception("failed to close websocket from outbox")
+            return True
+
+        return False
 
     def _submit(self, coro: Any) -> concurrent.futures.Future:
         return self._loop_thread.submit(coro)
@@ -112,20 +156,28 @@ class FlaskWebSocketBridge:
             registered = True
             logger.info("websocket connected: %s", client_id)
 
-            self._submit(
-                self._server._send_json(
-                    websocket,
-                    {"type": "connected", "data": {"client_id": client_id}},
-                )
-            ).result()
+            self._send_sync(
+                websocket,
+                json.dumps({"type": "connected", "data": {"client_id": client_id}}, ensure_ascii=False),
+            )
 
             while True:
-                raw_message = websocket.receive()
+                if self._flush_outbox(websocket):
+                    break
+
+                try:
+                    raw_message = websocket.receive(timeout=1)
+                except TimeoutError:
+                    continue
+
                 if raw_message is None:
                     break
                 if isinstance(raw_message, bytes):
                     raw_message = raw_message.decode("utf-8", errors="ignore")
                 self._submit(self._server._handle_message(websocket, raw_message)).result()
+
+                if self._flush_outbox(websocket):
+                    break
 
         except Exception as exc:
             logger.exception("websocket handling failed")
@@ -136,6 +188,7 @@ class FlaskWebSocketBridge:
                 logger.info("websocket disconnected: %s", self._server._client_id_by_socket.get(websocket))
                 self._submit(self._server._unregister_client(websocket)).result()
             self._drop_send_lock(websocket)
+            self._drop_outbox(websocket)
 
     def shutdown(self) -> None:
         self._loop_thread.stop()
