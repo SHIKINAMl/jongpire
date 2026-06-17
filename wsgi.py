@@ -1,0 +1,1 @@
+from mahjong_engine.communication.flask_ws_server import app
