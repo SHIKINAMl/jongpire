@@ -37,7 +37,7 @@ class MatchSession:
 class WebSocketGameServer:
 	"""WebSocket ゲームサーバー（2人マッチング）"""
 
-	def __init__(self, host: str = "127.0.0.1", port: int = 8765, max_players: int = 2):
+	def __init__(self, host: str = "0.0.0.0", port: int = 8000, max_players: int = 2):
 		self.host = host
 		self.port = port
 		self.max_players = max_players
