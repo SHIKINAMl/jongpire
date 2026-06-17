@@ -208,13 +208,12 @@ def create_app() -> Flask:
     def healthz() -> Any:
         return jsonify({"status": "ok"})
 
+    @app.route("/", methods=["GET", "HEAD"])
+    def root() -> Any:
+        return jsonify({"status": "ok"})
+
     @sock.route("/ws")
     def websocket_endpoint(ws: Any) -> None:
-        _bridge.handle_connection(ws)
-
-    @sock.route("/")
-    def websocket_endpoint_root(ws: Any) -> None:
-        # クライアントがパス未指定で接続してきた場合の後方互換。
         _bridge.handle_connection(ws)
 
     return app
