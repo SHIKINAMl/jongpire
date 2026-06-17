@@ -4,6 +4,8 @@ Render 向けエントリーポイント。
 starlette + uvicorn で起動する。
 HTTP GET/HEAD (ヘルスチェック) と WebSocket (/ws) を同じポートで扱う。
 """
+import os
+
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Route, WebSocketRoute
@@ -12,6 +14,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 from mahjong_engine.communication.websocket_server import WebSocketGameServer
 
 _game_server = WebSocketGameServer(host="0.0.0.0", port=0)
+_required_token = os.getenv("TOKEN", "")
 
 
 class _WSAdapter:
@@ -49,11 +52,28 @@ class _WSAdapter:
         return self is other
 
 
-async def health(request):
+async def health(_request):
     return JSONResponse({"status": "ok"})
 
 
 async def ws_endpoint(websocket: WebSocket):
+    if _required_token:
+        auth_header = websocket.headers.get("authorization", "")
+        token_header = websocket.headers.get("x-token", "")
+        query_token = websocket.query_params.get("token", "")
+
+        supplied_token = ""
+        if auth_header.lower().startswith("bearer "):
+            supplied_token = auth_header[7:].strip()
+        elif token_header:
+            supplied_token = token_header.strip()
+        elif query_token:
+            supplied_token = query_token.strip()
+
+        if supplied_token != _required_token:
+            await websocket.close(code=1008)
+            return
+
     await websocket.accept()
     adapter = _WSAdapter(websocket)
     await _game_server._on_connect(adapter)
