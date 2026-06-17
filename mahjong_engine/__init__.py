@@ -12,13 +12,11 @@ Mahjong Engine - 17歩ゲーム用エンジン
 
 from .engine import GameEngine, GameState
 from .communication import WebSocketGameServer
-from .ai import AIPlayer
 from .utils import TileConverter
 
 __all__ = [
     'GameEngine',
     'GameState',
     'WebSocketGameServer',
-    'AIPlayer',
     'TileConverter',
 ]
