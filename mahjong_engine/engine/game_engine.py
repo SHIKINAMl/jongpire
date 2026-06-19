@@ -377,7 +377,7 @@ class GameEngine:
         elif skill_type == SkillType.PERSPECTIVE:
             if target is None:
                 return True
-            unrevealed_indexes = [idx for idx in target.hand if idx not in target.exposed_hand_indexes]
+            unrevealed_indexes = [idx for idx in range(len(target.wall)) if idx not in target.exposed_hand_indexes]
             if not unrevealed_indexes:
                 return True
 
@@ -402,25 +402,16 @@ class GameEngine:
             user.boost_hand_bonus[yaku_name] = user.boost_hand_bonus.get(yaku_name, 0) + 1
 
         elif skill_type == SkillType.PERSPECTIVE:
-            participants = [user]
-            if target is not None and target.player_id != user.player_id:
-                participants.append(target)
-
-            for participant in participants:
-                if not participant.hand:
-                    continue
-
+            # 使用者の牌は公開しない。相手（target）の山牌全体から未公開の index を公開する
+            if target is not None and target.player_id != user.player_id and target.wall:
                 unrevealed_indexes = [
-                    idx for idx in participant.hand
-                    if idx not in participant.exposed_hand_indexes
+                    idx for idx in range(len(target.wall))
+                    if idx not in target.exposed_hand_indexes
                 ]
-                if not unrevealed_indexes:
-                    exposed_tiles[participant.player_id] = set(participant.exposed_hand_indexes)
-                    continue
-
-                exposed = random.sample(unrevealed_indexes, min(3, len(unrevealed_indexes)))
-                participant.exposed_hand_indexes.update(exposed)
-                exposed_tiles[participant.player_id] = set(participant.exposed_hand_indexes)
+                if unrevealed_indexes:
+                    exposed = random.sample(unrevealed_indexes, min(3, len(unrevealed_indexes)))
+                    target.exposed_hand_indexes.update(exposed)
+                exposed_tiles[target.player_id] = set(target.exposed_hand_indexes)
 
         elif skill_type == SkillType.MULLIGAN:
             target_index = options["target_hand_index"]
@@ -613,7 +604,8 @@ class GameEngine:
             return 2.0
         if han >= 6:
             return 1.5
-        return 1.0
+        if han >= 4:
+            return 1.0
 
     def _is_tanki_wait_agari(self, hand: list[int], winning_tile: int, winner_waits: list[int]) -> bool:
         """単騎待ちでの和了かどうかを判定する。"""
@@ -759,7 +751,7 @@ class GameEngine:
                 bet=p.bet if self._carry_over_bets else 0,
                 special_victory_count=p.special_victory_count,
                 boost_hand_bonus=p.boost_hand_bonus.copy(),
-                exposed_hand_indexes=p.exposed_hand_indexes.copy(),
+                exposed_hand_indexes=set(),  # 局が変わるたびにリセット（手牌が変わるため古い indexes は無効）
             )
             for p in self.state.players
         ]

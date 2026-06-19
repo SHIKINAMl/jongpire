@@ -886,7 +886,7 @@ class HandAnalyzer:
     @staticmethod
     def _is_terminal(tile_id: int) -> bool:
         """么九牌かどうかの判定"""
-        return tile_id % 9 == 0 or tile_id % 9 == 8
+        return HandAnalyzer._is_suited(tile_id) and (tile_id % 9 == 0 or tile_id % 9 == 8)
 
     @staticmethod
     def _tile_suit(tile_id: int) -> int:
@@ -903,7 +903,10 @@ class HandAnalyzer:
     @staticmethod
     def _is_tanyao(counter: Counter) -> bool:
         """断么九かどうかの判定"""
-        return all(not HandAnalyzer._is_terminal(tile_id) for tile_id in counter.keys())
+        return all(
+            HandAnalyzer._is_suited(tile_id) and not HandAnalyzer._is_terminal(tile_id)
+            for tile_id in counter.keys()
+        )
 
     @staticmethod
     def _is_pinfu(melds: List[Tuple[str, int]], head: int) -> bool:
@@ -943,7 +946,8 @@ class HandAnalyzer:
         if not HandAnalyzer._is_honor(head) and not HandAnalyzer._is_terminal(head):
             return False
         for kind, tile_id in melds:
-            if kind == "run" and (tile_id % 9 != 0 and tile_id % 9 != 7):
+            # 么九を含む順子は 123(開始0) または 789(開始6) のみ
+            if kind == "run" and (tile_id % 9 != 0 and tile_id % 9 != 6):
                 return False
             elif kind == "triplet" and not (HandAnalyzer._is_honor(tile_id) or HandAnalyzer._is_terminal(tile_id)):
                 return False
@@ -955,7 +959,8 @@ class HandAnalyzer:
         if not HandAnalyzer._is_terminal(head):
             return False
         for kind, tile_id in melds:
-            if kind == "run" and (tile_id % 9 != 0 and tile_id % 9 != 7):
+            # 么九を含む順子は 123(開始0) または 789(開始6) のみ
+            if kind == "run" and (tile_id % 9 != 0 and tile_id % 9 != 6):
                 return False
             elif kind == "triplet" and not HandAnalyzer._is_terminal(tile_id):
                 return False

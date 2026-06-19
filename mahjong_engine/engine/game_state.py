@@ -107,7 +107,7 @@ class PlayerState:
     bet: int = 0  # この局の掛け金
     special_victory_count: int = 0  # SPECIAL_VICTORY 累計使用回数（対局を通じて持続）
     boost_hand_bonus: dict = field(default_factory=dict)  # 役強化ボーナス {役名: 追加翻数}（スキル/開始時付与を含み対局を通じて持続）
-    exposed_hand_indexes: set = field(default_factory=set)  # PERSPECTIVE で公開された手牌インデックス（対局を通じて持続）
+    exposed_hand_indexes: set = field(default_factory=set)  # PERSPECTIVE で公開された手牌インデックス（局ごとにリセット）
 
 
 @dataclass

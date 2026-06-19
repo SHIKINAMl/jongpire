@@ -9,12 +9,15 @@ WebSocket API サーバー
 
 import asyncio
 import heapq
-import websockets
 import json
+import logging
 import time
+import websockets
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 from .game_session import GameSession
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class MatchSession:
@@ -37,7 +40,9 @@ class MatchSession:
 class WebSocketGameServer:
 	"""WebSocket ゲームサーバー（2人マッチング）"""
 
-	def __init__(self, host: str = "0.0.0.0", port: int = 8000, max_players: int = 2):
+	MAX_LOG_PAYLOAD_CHARS = 2000
+
+	def __init__(self, host: str = "127.0.0.1", port: int = 8765, max_players: int = 2):
 		self.host = host
 		self.port = port
 		self.max_players = max_players
@@ -74,14 +79,33 @@ class WebSocketGameServer:
 			broadcast_match_members=self._broadcast_match_members,
 		)
 
+	def _compact_for_log(self, payload: Any) -> str:
+		"""ログ出力用に JSON を1行化し、長い内容は切り詰める。"""
+		try:
+			text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+		except Exception:
+			text = repr(payload)
+
+		if len(text) > self.MAX_LOG_PAYLOAD_CHARS:
+			return text[: self.MAX_LOG_PAYLOAD_CHARS] + "...<truncated>"
+		return text
+
+	def _client_id_for_ws(self, websocket) -> str:
+		client_id = self._client_id_by_socket.get(websocket)
+		return client_id if client_id is not None else "unknown"
+
 	async def start(self) -> None:
 		"""サーバーを起動"""
 		if self._server is not None:
 			return
 
+		# 既定ハンドラ未設定時は INFO 以上を標準出力へ出す
+		if not logging.getLogger().handlers:
+			logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
 		self._websockets = websockets
 		self._server = await websockets.serve(self._on_connect, self.host, self.port)
-		print(f"[WebSocketGameServer] started ws://{self.host}:{self.port}")
+		logger.info("WebSocketGameServer started: ws://%s:%s", self.host, self.port)
 
 	async def stop(self) -> None:
 		"""サーバーを停止"""
@@ -104,7 +128,7 @@ class WebSocketGameServer:
 		self._active_match_by_client.clear()
 		self.game_engines.clear()
 
-		print("[WebSocketGameServer] stopped")
+		logger.info("WebSocketGameServer stopped")
 
 	async def wait_closed(self) -> None:
 		"""サーバー終了待ち"""
@@ -126,7 +150,7 @@ class WebSocketGameServer:
 				}
 			)
 
-			print(f"[WebSocketGameServer] client connected: {client_id}")
+			logger.info("client connected: %s", client_id)
 
 			async for raw_message in websocket:
 				await self._handle_message(websocket, raw_message)
@@ -157,7 +181,7 @@ class WebSocketGameServer:
 		cancel_payload: Optional[Dict[str, Any]] = None
 		requeue_targets: List[str] = []
 
-		print(f"[WebSocketGameServer] client disconnected: {self._client_id_by_socket.get(websocket)}")
+		logger.info("client disconnected: %s", self._client_id_for_ws(websocket))
 
 		async with self._lock:
 			client_id = self._client_id_by_socket.pop(websocket, None)
@@ -214,10 +238,12 @@ class WebSocketGameServer:
 
 	async def _handle_message(self, websocket, raw_message: str) -> None:
 		"""クライアントからのメッセージを処理する"""
+		client_id = self._client_id_for_ws(websocket)
+		logger.info("ws recv client=%s payload=%s", client_id, self._compact_for_log(raw_message))
 		try:
 			data = json.loads(raw_message)
-			print(f"[WebSocketGameServer] received message: {data} from {self._client_id_by_socket.get(websocket)}")
 		except json.JSONDecodeError:
+			logger.warning("ws recv invalid json: client=%s payload=%s", client_id, self._compact_for_log(raw_message))
 			await self._send_json(websocket, {"type": "error", "message": "Invalid JSON"})
 			return
 
@@ -393,10 +419,12 @@ class WebSocketGameServer:
 	async def _send_json(self, websocket, payload: Dict[str, Any]) -> None:
 		if websocket is None:
 			return
+		client_id = self._client_id_for_ws(websocket)
+		logger.info("ws send client=%s payload=%s", client_id, self._compact_for_log(payload))
 		try:
 			await websocket.send(json.dumps(payload, ensure_ascii=False))
 		except Exception:
-			pass
+			logger.exception("ws send failed: client=%s", client_id)
 
 	async def _safe_close(self, websocket) -> None:
 		try:

@@ -24,6 +24,7 @@ class Yaku(Enum):
     HONROUTOU = ("混老頭", 2)
     CHANTA = ("混全帯么九", 2)
     CHIITOI = ("七対子", 2)
+    IKKITSUUKAN = ("一気通貫", 2)
 
     # ========== 3翻役 ==========
     RYANPEIKOU = ("二盃口", 3)
