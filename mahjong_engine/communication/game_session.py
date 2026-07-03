@@ -300,6 +300,7 @@ class GameSession:
 			"is_tenpai": self._is_tenpai,
 			"skill": self._skill,
 			"select": self._select,
+			"select_cancel": self._select_cancel,
 			"select_confirm": self._select_confirm,
 			"bet": self._bet,
 			"discard": self._discard,
@@ -398,6 +399,9 @@ class GameSession:
 							"mangan_or_more" : w[1],
 							"yaku" : w[2],
 							"base_yaku": w[3],
+							"han": w[4],
+							"multiplier": w[5],
+							"multiplier_label": w[6],
 						} for w in waits
 					]
 				},
@@ -549,6 +553,26 @@ class GameSession:
 
 		else:
 			await self._send_error(client_id, "手牌が聴牌であるか、満貫以上の役の可能性が必要です")
+
+	async def _select_cancel(self, engine: GameEngine, client_id: str, _action_data: Dict[str, Any]) -> None:
+		"""手牌選択の確定を取り下げる。"""
+		if not await self._ensure_phase(engine, client_id, RoundStatus.HAND_SELECTION, "select_cancel"):
+			return
+
+		match_id = self._active_match_by_client.get(client_id)
+		if not match_id:
+			await self._send_error(client_id, "Not in game")
+			return
+
+		player = engine.get_player_by_id(client_id)
+		if player is None:
+			await self._send_error(client_id, "Player not found")
+			return
+
+		self._pending_low_hand_confirmations.pop(client_id, None)
+		self._unmark_hand_selection_confirmed(match_id, client_id)
+		player.hand = []
+		player.waits = []
 
 	async def _select_confirm(self, engine: GameEngine, client_id: str, action_data: Dict[str, Any]) -> None:
 		"""二段階目の手牌確定アクション（満貫以下・非聴牌でも確定可能）"""
