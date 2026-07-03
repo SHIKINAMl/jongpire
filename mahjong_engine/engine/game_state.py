@@ -105,9 +105,10 @@ class PlayerState:
     discarded_wall_indexes: set[int] = field(default_factory=set)  # 打牌済みの wall index
     health: int = 20000  # 現在の HP
     bet: int = 0  # この局の掛け金
+    base_bet: int = 0  # 流局持ち越し時に加算する基準掛け金（最初に設定した額）
     special_victory_count: int = 0  # SPECIAL_VICTORY 累計使用回数（対局を通じて持続）
     boost_hand_bonus: dict = field(default_factory=dict)  # 役強化ボーナス {役名: 追加翻数}（スキル/開始時付与を含み対局を通じて持続）
-    exposed_hand_indexes: set = field(default_factory=set)  # PERSPECTIVE で公開された手牌インデックス（局ごとにリセット）
+    exposed_hand_indexes: set = field(default_factory=set)  # PERSPECTIVE で公開された手牌インデックス（対局を通じて持続）
 
 
 @dataclass

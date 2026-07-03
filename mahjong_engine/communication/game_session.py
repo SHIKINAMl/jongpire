@@ -901,8 +901,22 @@ class GameSession:
 
 		exposed_by_player: Dict[str, List[int]] = {}
 		exposed_flat: List[int] = []
+		mulligan_result: Optional[Dict[str, int]] = None
 		if isinstance(exposed_indexes, dict):
+			raw_mulligan = exposed_indexes.get("__mulligan__")
+			if isinstance(raw_mulligan, dict):
+				try:
+					mulligan_result = {
+						"targetHandIndex": int(raw_mulligan["target_hand_index"]),
+						"oldTile": int(raw_mulligan["old_tile"]),
+						"newTile": int(raw_mulligan["new_tile"]),
+					}
+				except Exception:
+					mulligan_result = None
+
 			for cid, indexes in exposed_indexes.items():
+				if cid == "__mulligan__":
+					continue
 				try:
 					normalized = sorted(int(i) for i in indexes)
 				except Exception:
@@ -927,6 +941,7 @@ class GameSession:
 					"health": player.health if player else None,
 					"exposedHandIndexes": exposed_flat,
 					"exposedHandIndexesByPlayer": exposed_by_player,
+					"mulliganResult": mulligan_result,
 				},
 			},
 		)
