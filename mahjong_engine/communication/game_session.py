@@ -51,6 +51,19 @@ class GameSession:
 			await self._send_error(client_id, "Failed to deliver response")
 			return False
 
+	async def _notify_other_player(self, match_id: str, source_client_id: str, payload: Dict[str, Any]) -> None:
+		"""同一マッチの相手プレイヤーにだけ通知する。"""
+		async with self._lock:
+			match = self._matches.get(match_id)
+			if match is None:
+				return
+			player_ids = [cid for cid in match.players if cid != source_client_id]
+
+		await asyncio.gather(
+			*(self._send_to_client(cid, payload) for cid in player_ids),
+			return_exceptions=True,
+		)
+
 	async def _ensure_phase(
 		self,
 		engine: GameEngine,
@@ -341,6 +354,7 @@ class GameSession:
 			"discarded_wall_indexes": sorted(player.discarded_wall_indexes),
 			"health": player.health,
 			"bet": player.bet,
+			"cumulative_earned_points": player.cumulative_earned_points,
 			"special_victory_count": player.special_victory_count,
 			"boost_hand_bonus": dict(player.boost_hand_bonus),
 			"exposed_hand_indexes": sorted(player.exposed_hand_indexes),
@@ -546,6 +560,17 @@ class GameSession:
 					"wall": player.wall,
 				},
 			})
+			await self._notify_other_player(
+				match_id,
+				client_id,
+				{
+					"type": "phase_completed_notice",
+					"data": {
+						"phase": "hand_selection",
+						"player_id": client_id,
+					},
+				},
+			)
 
 			if self._are_all_hand_selections_confirmed(match_id, engine):
 				self._clear_hand_selection_confirmations(match_id)
@@ -621,6 +646,17 @@ class GameSession:
 				"forced": True,
 			},
 		})
+		await self._notify_other_player(
+			match_id,
+			client_id,
+			{
+				"type": "phase_completed_notice",
+				"data": {
+					"phase": "hand_selection",
+					"player_id": client_id,
+				},
+			},
+		)
 
 		if self._are_all_hand_selections_confirmed(match_id, engine):
 			self._clear_hand_selection_confirmations(match_id)
@@ -657,6 +693,18 @@ class GameSession:
 				"bet_unit": bet_unit,
 			},
 		})
+		await self._notify_other_player(
+			self._active_match_by_client[client_id],
+			client_id,
+			{
+				"type": "phase_completed_notice",
+				"data": {
+					"phase": "bet",
+					"player_id": client_id,
+					"bet_amount": bet_amount,
+				},
+			},
+		)
 
 		if all(p.bet > 0 for p in engine.state.players):
 			engine.bet()
@@ -1037,6 +1085,14 @@ class GameSession:
 		self._clear_hand_selection_confirmations(match_id)
 		if engine:
 			self._clear_pending_confirmations_for_engine(engine)
+			if any(p.health <= 0 for p in engine.state.players):
+				victory_method = "hp_zero"
+			elif any(p.cumulative_earned_points >= 30000 for p in engine.state.players):
+				victory_method = "cumulative_earned_points"
+			elif engine.state.round_state.round_number >= engine.max_rounds:
+				victory_method = "max_rounds"
+			else:
+				victory_method = "unknown"
 
 			final_scores = {}
 			for p in engine.state.players:
@@ -1049,6 +1105,7 @@ class GameSession:
 				{
 					"type": "game_end",
 					"final_scores": final_scores,
+					"victory_method": victory_method,
 				},
 			)
 

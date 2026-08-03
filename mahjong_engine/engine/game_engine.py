@@ -765,6 +765,7 @@ class GameEngine:
         # 勝者: 累積済み掛け金 × 役倍率分を獲得
         winner_gain = int(winner_effective_bet * multiplier)
         winner.health += winner_gain
+        winner.cumulative_earned_points += winner_gain
 
         # 敗者: 単騎待ち和了時のみ支払いを倍化（勝者獲得量は据え置き）
         loser_loss_multiplier = 2 if is_tanki_wait else 1
@@ -810,6 +811,7 @@ class GameEngine:
                 discarded_wall_indexes=set(),
                 bet=p.bet if self._carry_over_bets else 0,
                 base_bet=p.base_bet if self._carry_over_bets else 0,
+                cumulative_earned_points=p.cumulative_earned_points,
                 special_victory_count=p.special_victory_count,
                 boost_hand_bonus=p.boost_hand_bonus.copy(),
                 exposed_hand_indexes=set(),  # 局が変わるたびにリセット（手牌が変わるため古い indexes は無効）
@@ -859,6 +861,18 @@ class GameEngine:
         if any(p.health <= 0 for p in self.state.players):
             dead = [p.player_id for p in self.state.players if p.health <= 0]
             logger.info("HPゼロによるゲーム終了: players=%s", dead)
+            self._invoke_callback(self.on_round_end, is_draw)
+            self._on_game_end()
+            return
+
+        # 勝利時の獲得累計点数が 30000 に到達したらゲーム終了
+        point_winner = next((p for p in self.state.players if p.cumulative_earned_points >= 30000), None)
+        if point_winner is not None:
+            logger.info(
+                "累計獲得点数到達によるゲーム終了: player=%s cumulative_earned_points=%d",
+                point_winner.player_id,
+                point_winner.cumulative_earned_points,
+            )
             self._invoke_callback(self.on_round_end, is_draw)
             self._on_game_end()
             return
@@ -970,6 +984,7 @@ class GameEngine:
                 {
                     "id": p.player_id,
                     "health": p.health,
+                    "cumulative_earned_points": p.cumulative_earned_points,
                     "hand": p.hand,
                     "wall": p.wall,
                     "waits": p.waits,

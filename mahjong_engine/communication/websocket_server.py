@@ -11,6 +11,7 @@ import asyncio
 import heapq
 import json
 import logging
+import string
 import time
 import websockets
 from dataclasses import dataclass, field
@@ -41,6 +42,8 @@ class WebSocketGameServer:
 	"""WebSocket ゲームサーバー（2人マッチング）"""
 
 	MAX_LOG_PAYLOAD_CHARS = 2000
+	PRIVATE_ROOM_PASSWORD_LENGTH = 5
+	PRIVATE_ROOM_PASSWORD_CHARS = string.ascii_uppercase + string.digits
 
 	def __init__(self, host: str = "127.0.0.1", port: int = 8765, max_players: int = 2):
 		self.host = host
@@ -63,6 +66,8 @@ class WebSocketGameServer:
 
 		# マッチング待機キュー（先着順）
 		self._waiting_queue: List[str] = []
+		self._private_room_by_password: Dict[str, str] = {}
+		self._private_password_by_client: Dict[str, str] = {}
 
 		# マッチ情報
 		self._matches: Dict[str, MatchSession] = {}
@@ -124,6 +129,8 @@ class WebSocketGameServer:
 		self._socket_by_client_id.clear()
 		self._client_name.clear()
 		self._waiting_queue.clear()
+		self._private_room_by_password.clear()
+		self._private_password_by_client.clear()
 		self._matches.clear()
 		self._active_match_by_client.clear()
 		self.game_engines.clear()
@@ -199,6 +206,11 @@ class WebSocketGameServer:
 			if client_id in self._waiting_queue:
 				self._waiting_queue.remove(client_id)
 
+			# 非公開部屋のパスワードを解放
+			password = self._private_password_by_client.pop(client_id, None)
+			if password is not None:
+				self._private_room_by_password.pop(password, None)
+
 			# 対局中マッチから除外
 			match_id = self._active_match_by_client.pop(client_id, None)
 			if match_id and match_id in self._matches:
@@ -270,7 +282,7 @@ class WebSocketGameServer:
 		if msg_type == "join":
 			client_id = self._client_id_by_socket.get(websocket)
 			if client_id:
-				await self._enqueue_for_matchmaking(client_id)
+				await self._handle_join_request(client_id, data.get("data"))
 			return
 
 		if msg_type == "action":
@@ -281,6 +293,65 @@ class WebSocketGameServer:
 
 		await self._send_json(websocket, {"type": "error", "message": f"Unknown type: {msg_type}"})
 
+	def _normalize_join_payload(self, payload: Any) -> Dict[str, Any]:
+		if isinstance(payload, dict):
+			return payload
+		return {}
+
+	def _is_valid_private_room_password(self, password: Any) -> bool:
+		return (
+			isinstance(password, str)
+			and len(password) == self.PRIVATE_ROOM_PASSWORD_LENGTH
+			and all(ch in self.PRIVATE_ROOM_PASSWORD_CHARS for ch in password)
+		)
+
+	def _generate_private_room_password_locked(self) -> str:
+		while True:
+			password = "".join(
+				self._random_choice(self.PRIVATE_ROOM_PASSWORD_CHARS)
+				for _ in range(self.PRIVATE_ROOM_PASSWORD_LENGTH)
+			)
+			if password not in self._private_room_by_password:
+				return password
+
+	def _random_choice(self, chars: str) -> str:
+		import random
+		return random.choice(chars)
+
+	def _create_match_locked(self, player_ids: List[str]) -> MatchSession:
+		if self._available_match_numbers:
+			match_number = heapq.heappop(self._available_match_numbers)
+		else:
+			self._match_seq += 1
+			match_number = self._match_seq
+
+		match_id = f"M{match_number:04d}"
+		match = MatchSession(match_id=match_id, players=list(player_ids), status="in_game")
+		self._matches[match_id] = match
+
+		for cid in player_ids:
+			self._active_match_by_client[cid] = match_id
+
+		return match
+
+	async def _handle_join_request(self, client_id: str, payload: Any) -> None:
+		join_data = self._normalize_join_payload(payload)
+		mode = join_data.get("mode", "public")
+
+		if mode == "public":
+			await self._enqueue_for_matchmaking(client_id)
+			return
+
+		if mode == "private_create":
+			await self._create_private_room(client_id)
+			return
+
+		if mode == "private_join":
+			await self._join_private_room(client_id, join_data.get("password"))
+			return
+
+		await self._send_to_client(client_id, {"type": "error", "message": f"Unsupported join mode: {mode}"})
+
 	async def _enqueue_for_matchmaking(self, client_id: str) -> None:
 		"""プレイヤーを待機キューへ追加し、揃えば自動でマッチさせる"""
 		async with self._lock:
@@ -290,15 +361,85 @@ class WebSocketGameServer:
 			if client_id in self._waiting_queue:
 				await self._send_to_client(client_id, {"type": "error", "message": "Already in matchmaking queue"})
 				return
+			if client_id in self._private_password_by_client:
+				await self._send_to_client(client_id, {"type": "error", "message": "Private room already created"})
+				return
 			if client_id not in self._socket_by_client_id:
 				await self._send_to_client(client_id, {"type": "error", "message": "Client not connected"})
 				return
 
 			self._waiting_queue.append(client_id)
 
-		await self._send_waiting_message(client_id)
+		await self._send_waiting_message(client_id, mode="public")
 		#await self._broadcast_matchmaking_state()
 		await self._try_make_match()
+
+	async def _create_private_room(self, client_id: str) -> None:
+		async with self._lock:
+			if client_id in self._active_match_by_client:
+				await self._send_to_client(client_id, {"type": "error", "message": "Already in a match"})
+				return
+			if client_id in self._waiting_queue:
+				await self._send_to_client(client_id, {"type": "error", "message": "Already in matchmaking queue"})
+				return
+			if client_id in self._private_password_by_client:
+				await self._send_to_client(client_id, {"type": "error", "message": "Private room already created"})
+				return
+			if client_id not in self._socket_by_client_id:
+				await self._send_to_client(client_id, {"type": "error", "message": "Client not connected"})
+				return
+
+			password = self._generate_private_room_password_locked()
+			self._private_room_by_password[password] = client_id
+			self._private_password_by_client[client_id] = password
+
+		await self._send_waiting_message(client_id, mode="private_host", password=password)
+
+	async def _join_private_room(self, client_id: str, password: Any) -> None:
+		if not self._is_valid_private_room_password(password):
+			await self._send_to_client(
+				client_id,
+				{"type": "error", "message": "Password must be 5 uppercase alphanumeric characters"},
+			)
+			return
+
+		match: Optional[MatchSession] = None
+
+		async with self._lock:
+			if client_id in self._active_match_by_client:
+				await self._send_to_client(client_id, {"type": "error", "message": "Already in a match"})
+				return
+			if client_id in self._waiting_queue:
+				await self._send_to_client(client_id, {"type": "error", "message": "Already in matchmaking queue"})
+				return
+			if client_id in self._private_password_by_client:
+				await self._send_to_client(client_id, {"type": "error", "message": "Private room already created"})
+				return
+			if client_id not in self._socket_by_client_id:
+				await self._send_to_client(client_id, {"type": "error", "message": "Client not connected"})
+				return
+
+			host_id = self._private_room_by_password.get(password)
+			if host_id is None:
+				await self._send_to_client(client_id, {"type": "error", "message": "Private room not found"})
+				return
+			if host_id == client_id:
+				await self._send_to_client(client_id, {"type": "error", "message": "Cannot join your own private room"})
+				return
+			if host_id not in self._socket_by_client_id:
+				self._private_room_by_password.pop(password, None)
+				self._private_password_by_client.pop(host_id, None)
+				await self._send_to_client(client_id, {"type": "error", "message": "Private room not found"})
+				return
+
+			self._private_room_by_password.pop(password, None)
+			self._private_password_by_client.pop(host_id, None)
+			match = self._create_match_locked([host_id, client_id])
+
+		if match is None:
+			return
+
+		await self._game_session.start_match(match)
 
 	async def _try_make_match(self) -> None:
 		"""待機キュー先頭から2人を取り出してマッチ開始"""
@@ -311,19 +452,7 @@ class WebSocketGameServer:
 
 			player_ids = self._waiting_queue[: self.max_players]
 			del self._waiting_queue[: self.max_players]
-
-			if self._available_match_numbers:
-				match_number = heapq.heappop(self._available_match_numbers)
-			else:
-				self._match_seq += 1
-				match_number = self._match_seq
-
-			match_id = f"M{match_number:04d}"
-			match = MatchSession(match_id=match_id, players=list(player_ids), status="in_game")
-			self._matches[match_id] = match
-
-			for cid in player_ids:
-				self._active_match_by_client[cid] = match_id
+			match = self._create_match_locked(player_ids)
 
 		if match is None:
 			return
@@ -331,7 +460,7 @@ class WebSocketGameServer:
 		await self._game_session.start_match(match)
 		#await self._broadcast_matchmaking_state()
 
-	async def _send_waiting_message(self, client_id: str) -> None:
+	async def _send_waiting_message(self, client_id: str, mode: str = "public", password: Optional[str] = None) -> None:
 		"""マッチング待機中のクライアントに現在の待機状況を送信"""
 		queue_pos = 0
 		queue_size = 0
@@ -344,11 +473,13 @@ class WebSocketGameServer:
 			client_id,
 			{
 				"type": "matching_waiting",
-				#"data": {
-				#	"queue_position": queue_pos,
-				#	"queue_size": queue_size,
-				#	"need_players": max(self.max_players - queue_size, 0),
-				#},
+				"data": {
+					"mode": mode,
+					"password": password,
+					"queue_position": queue_pos,
+					"queue_size": queue_size,
+					"need_players": max(self.max_players - queue_size, 0),
+				},
 			},
 		)
 
