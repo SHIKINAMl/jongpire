@@ -257,7 +257,13 @@ class GameSession:
 			"type": "game_started",
 			"data": {
 				"match_id": match.match_id,
-				"players": [{"client_id": cid} for cid in match.players],
+				"players": [
+					{
+						"client_id": cid,
+						"health": engine.state.players[idx].health,
+					}
+					for idx, cid in enumerate(match.players)
+				],
 			},
 		}
 
@@ -667,6 +673,11 @@ class GameSession:
 		if not await self._ensure_phase(engine, client_id, RoundStatus.BETTING, "bet"):
 			return
 
+		match_id = self._active_match_by_client.get(client_id)
+		if not match_id:
+			await self._send_error(client_id, "Not in game")
+			return
+
 		player = engine.get_player_by_id(client_id)
 		if player is None:
 			await self._send_error(client_id, "Player not found")
@@ -691,10 +702,11 @@ class GameSession:
 				"bet_amount": bet_amount,
 				"max_bet": max_bet,
 				"bet_unit": bet_unit,
+				"health": player.health,
 			},
 		})
 		await self._notify_other_player(
-			self._active_match_by_client[client_id],
+			match_id,
 			client_id,
 			{
 				"type": "phase_completed_notice",
@@ -705,6 +717,11 @@ class GameSession:
 				},
 			},
 		)
+
+		if player.health < 0:
+			logger.info("ベット確定後のHPマイナスによるゲーム終了: player=%s health=%d", player.player_id, player.health)
+			await self.on_game_end(match_id)
+			return
 
 		if all(p.bet > 0 for p in engine.state.players):
 			engine.bet()
@@ -912,6 +929,7 @@ class GameSession:
 			{
 				"client_id": await self.resolve_client_id(match_id, i),
 				"bet": b,
+				"health": self._game_engines[match_id].state.players[i].health,
 			}
 			for i, b in enumerate(bet)
 		]
@@ -1085,7 +1103,7 @@ class GameSession:
 		self._clear_hand_selection_confirmations(match_id)
 		if engine:
 			self._clear_pending_confirmations_for_engine(engine)
-			if any(p.health <= 0 for p in engine.state.players):
+			if any(p.health < 0 for p in engine.state.players):
 				victory_method = "hp_zero"
 			elif any(p.cumulative_earned_points >= 30000 for p in engine.state.players):
 				victory_method = "cumulative_earned_points"
@@ -1095,16 +1113,26 @@ class GameSession:
 				victory_method = "unknown"
 
 			final_scores = {}
+			player_healths = []
+			health_zero_players = []
 			for p in engine.state.players:
 				resolved_client_id = await self.resolve_client_id(match_id, p.player_id)
 				score_key = resolved_client_id if resolved_client_id is not None else str(p.player_id)
 				final_scores[score_key] = p.health
+				player_healths.append({
+					"client_id": score_key,
+					"health": p.health,
+				})
+				if p.health < 0:
+					health_zero_players.append(score_key)
 
 			await self._broadcast_match_members(
 				match_id,
 				{
 					"type": "game_end",
 					"final_scores": final_scores,
+					"player_healths": player_healths,
+					"health_zero_players": health_zero_players,
 					"victory_method": victory_method,
 				},
 			)

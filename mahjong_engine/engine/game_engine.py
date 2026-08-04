@@ -86,12 +86,8 @@ class GameEngine:
 
         hands = [self.tile_wall.deal() for _ in range(self.num_players)]
 
-        # MULLIGAN 交換用の reserved_tiles を計算
-        # 全 116 牌 - (配られた 68 牌 + ドラの 1 牌) = 47 牌
-        dealt_tiles = [tile for wall, _ in hands for tile in wall] + [self.tile_wall.dora_id]
-        used_set = set(dealt_tiles)
-        reserved = [t for t in range(116) if t not in used_set]
-        self.state.round_state.reserved_tiles = reserved
+        # 配牌後に牌山へ残った実牌を MULLIGAN の交換候補にする。
+        self.state.round_state.reserved_tiles = list(self.tile_wall.tiles)
 
         def _to_wall_indexes(wall_tiles: list[int], hand_tiles: list[int]) -> list[int]:
             used = [False] * len(wall_tiles)
@@ -145,6 +141,12 @@ class GameEngine:
 
     def bet(self) -> None:
         """掛け金設定フェーズを完了し、打牌フェーズを開始"""
+        dead_players = [player.player_id for player in self.state.players if player.health < 0]
+        if dead_players:
+            logger.info("ベット確定時のHPマイナスによるゲーム終了: players=%s", dead_players)
+            self._on_game_end()
+            return
+
         self._invoke_callback(self.on_bet)
         self._set_phase(RoundStatus.DISCARD)
         self.state.round_state.current_player_index = random.randrange(0, self.num_players)
@@ -176,6 +178,9 @@ class GameEngine:
         if player.health < bet_amount:
             return False
 
+        player.health -= bet_amount
+        if player.health < 0:
+            player.health = 0
         player.bet = bet_amount
         player.base_bet = bet_amount
         return True
@@ -857,10 +862,10 @@ class GameEngine:
             self._on_game_end()
             return
 
-        # 精算後に HP が 0 以下のプレイヤーがいればゲーム終了
-        if any(p.health <= 0 for p in self.state.players):
-            dead = [p.player_id for p in self.state.players if p.health <= 0]
-            logger.info("HPゼロによるゲーム終了: players=%s", dead)
+        # 精算後に HP がマイナスのプレイヤーがいればゲーム終了
+        if any(p.health < 0 for p in self.state.players):
+            dead = [p.player_id for p in self.state.players if p.health < 0]
+            logger.info("HPマイナスによるゲーム終了: players=%s", dead)
             self._invoke_callback(self.on_round_end, is_draw)
             self._on_game_end()
             return
