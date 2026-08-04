@@ -21,6 +21,7 @@ class SkillType(Enum):
     MULLIGAN = "mulligan"  # 手牌交換スキル
     BOOST_HAND = "boost_hand"  # 指定役の翻数 +1
     PERSPECTIVE = "perspective"  # 相手の手牌 3 枚を公開
+    ASSAULT = "assault"  # 勝利時獲得点を0にし、同値を追加ダメージ化
     SPECIAL_VICTORY = "special_victory"  # 3 回目使用で勝利
 
 
@@ -32,6 +33,7 @@ HP_COST_TABLE: list[dict] = [
             SkillType.MULLIGAN: 1200,
             SkillType.PERSPECTIVE: 1500,
             SkillType.BOOST_HAND: 10000,
+            SkillType.ASSAULT: 3000,
             SkillType.SPECIAL_VICTORY: 30000,
         },
         "bet_max": 5000,
@@ -42,6 +44,7 @@ HP_COST_TABLE: list[dict] = [
             SkillType.MULLIGAN: 1000,
             SkillType.PERSPECTIVE: 3000,
             SkillType.BOOST_HAND: 9000,
+            SkillType.ASSAULT: 3000,
             SkillType.SPECIAL_VICTORY: 30000,
         },
         "bet_max": 10000,
@@ -52,6 +55,7 @@ HP_COST_TABLE: list[dict] = [
             SkillType.MULLIGAN: 800,
             SkillType.PERSPECTIVE: 4500,
             SkillType.BOOST_HAND: 8000,
+            SkillType.ASSAULT: 3000,
             SkillType.SPECIAL_VICTORY: 45000,
         },
         "bet_max": 50000,
@@ -110,6 +114,8 @@ class PlayerState:
     special_victory_count: int = 0  # SPECIAL_VICTORY 累計使用回数（対局を通じて持続）
     boost_hand_bonus: dict = field(default_factory=dict)  # 役強化ボーナス {役名: 追加翻数}（スキル/開始時付与を含み対局を通じて持続）
     exposed_hand_indexes: set = field(default_factory=set)  # PERSPECTIVE で公開された手牌インデックス（局ごとにリセット）
+    assault_active_this_round: bool = False  # ASSAULT 発動済みなら、この局の和了時効果を有効化
+    assault_used_this_round: bool = False  # ASSAULT の局内使用回数制限（1局1回）
 
 
 @dataclass

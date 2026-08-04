@@ -388,6 +388,10 @@ class GameEngine:
             if not unrevealed_indexes:
                 return True
 
+        elif skill_type == SkillType.ASSAULT:
+            if user.assault_used_this_round:
+                return True
+
         return False
 
     def _apply_skill_effect(self, user: PlayerState, skill_type: SkillType, target: PlayerState | None, options: dict) -> dict:
@@ -435,6 +439,10 @@ class GameEngine:
                 "old_tile": old_tile_id,
                 "new_tile": new_tile_id,
             }
+
+        elif skill_type == SkillType.ASSAULT:
+            user.assault_used_this_round = True
+            user.assault_active_this_round = True
 
         return exposed_tiles
 
@@ -768,13 +776,16 @@ class GameEngine:
         loser_effective_bet = loser.bet * carry_rounds
 
         # 勝者: 累積済み掛け金 × 役倍率分を獲得
-        winner_gain = int(winner_effective_bet * multiplier)
+        winner_original_gain = int(winner_effective_bet * multiplier)
+        assault_applied = winner.assault_active_this_round
+        assault_bonus_damage = winner_original_gain if assault_applied else 0
+        winner_gain = 0 if assault_applied else winner_original_gain
         winner.health += winner_gain
         winner.cumulative_earned_points += winner_gain
 
         # 敗者: 単騎待ち和了時のみ支払いを倍化（勝者獲得量は据え置き）
         loser_loss_multiplier = 2 if is_tanki_wait else 1
-        loser_loss = int(loser_effective_bet * multiplier * loser_loss_multiplier)
+        loser_loss = int(loser_effective_bet * multiplier * loser_loss_multiplier) + assault_bonus_damage
         loser.health = max(0, loser.health - loser_loss)
 
         self._last_liquidation_result = {
@@ -789,9 +800,12 @@ class GameEngine:
             "multiplier": multiplier,
             "winner_bet": winner_effective_bet,
             "loser_bet": loser_effective_bet,
+            "winner_original_gain": winner_original_gain,
             "winner_gain": winner_gain,
             "loser_loss": loser_loss,
             "loser_loss_multiplier": loser_loss_multiplier,
+            "assault_applied": assault_applied,
+            "assault_bonus_damage": assault_bonus_damage,
             "is_tanki_wait": is_tanki_wait,
             "carry_over_draw_count": self._carry_over_draw_count,
             "winner_health": winner.health,

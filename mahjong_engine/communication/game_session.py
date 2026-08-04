@@ -496,6 +496,9 @@ class GameSession:
 		elif skill_type == SkillType.SPECIAL_VICTORY:
 			return engine.use_skill(user, skill_type)
 
+		elif skill_type == SkillType.ASSAULT:
+			return engine.use_skill(user, skill_type)
+
 		elif skill_type == SkillType.PERSPECTIVE:
 			# 相手を取得
 			target = next((p for p in engine.state.players if p.player_id != user.player_id), None)
