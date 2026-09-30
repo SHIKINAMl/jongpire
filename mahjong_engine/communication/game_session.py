@@ -2,6 +2,7 @@ import asyncio
 import heapq
 import logging
 import random
+import time
 import traceback
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 
@@ -34,6 +35,10 @@ class GameSession:
 		self._broadcast_match_members = broadcast_match_members
 		self._pending_low_hand_confirmations: Dict[str, List[int]] = {}
 		self._confirmed_hand_players_by_match: Dict[str, Set[str]] = {}
+		# マッチごとに起動した非同期タスク（マッチ終了時にまとめてキャンセルする）
+		self._tasks_by_match: Dict[str, Set[asyncio.Task]] = {}
+		# マッチごとの最終操作時刻（放置マッチの検出に使う）
+		self._last_activity_by_match: Dict[str, float] = {}
 
 	async def _send_error(self, client_id: str, message: str) -> None:
 		"""クライアントへのエラー通知"""
@@ -129,7 +134,8 @@ class GameSession:
 	def _find_any_tenpai_example_indexes(self, wall: List[int], dora_id: int) -> Optional[List[int]]:
 		"""wall から満貫以上の聴牌形を再探索して、最初に index 変換できる例を返す。"""
 		try:
-			candidates = HandAnalyzer.search_tenpai(wall, wall, dora_id)
+			# 全列挙すると数秒かかりイベントループを止めるため、数件見つかれば打ち切る
+			candidates = HandAnalyzer.search_tenpai(wall, wall, dora_id, limit=5)
 		except Exception:
 			return None
 
@@ -140,16 +146,88 @@ class GameSession:
 
 		return None
 
+	def _spawn(self, match_id: str, coro: Awaitable[None]) -> asyncio.Task:
+		"""マッチに紐づくタスクを起動し、終了時の片付けと例外ログを仕込む。"""
+		task = asyncio.create_task(coro)
+		tasks = self._tasks_by_match.setdefault(match_id, set())
+		tasks.add(task)
+
+		def _on_done(t: asyncio.Task) -> None:
+			tasks.discard(t)
+			if t.cancelled():
+				return
+			exc = t.exception()
+			if exc is not None:
+				logger.error(
+					"マッチのタスクで例外: match_id=%s",
+					match_id,
+					exc_info=(type(exc), exc, exc.__traceback__),
+				)
+
+		task.add_done_callback(_on_done)
+		return task
+
 	def _create_task_callback(
 		self,
 		handler: Callable[..., Awaitable[None]],
-		*fixed_args,
+		match_id: str,
 	) -> Callable[..., None]:
 		"""コールバックから非同期ハンドラを fire-and-forget で起動する。"""
 		def _callback(*args) -> None:
-			asyncio.create_task(handler(*fixed_args, *args))
+			self._spawn(match_id, handler(match_id, *args))
 
 		return _callback
+
+	def touch_match(self, match_id: str) -> None:
+		"""マッチの最終操作時刻を更新する。"""
+		if match_id in self._last_activity_by_match:
+			self._last_activity_by_match[match_id] = time.monotonic()
+
+	def find_idle_matches(self, idle_seconds: float) -> List[str]:
+		"""最終操作から idle_seconds 以上経過したマッチ ID を返す。"""
+		threshold = time.monotonic() - idle_seconds
+		return [mid for mid, last in self._last_activity_by_match.items() if last < threshold]
+
+	def cleanup_match_locked(self, match_id: str) -> Optional[Any]:
+		"""
+		マッチに関する状態をすべて破棄する。self._lock を保持した状態で呼ぶこと。
+		正常終了・切断・放置のどの経路からも、この関数でだけ片付ける。
+
+		Returns:
+			破棄したマッチ（既に破棄済みなら None）
+		"""
+		match = self._matches.pop(match_id, None)
+		engine = self._game_engines.pop(match_id, None)
+		if engine is not None:
+			engine.dispose()
+		self._confirmed_hand_players_by_match.pop(match_id, None)
+		self._last_activity_by_match.pop(match_id, None)
+
+		# 自分自身（on_game_end など）はキャンセルしない
+		current = asyncio.current_task()
+		for task in self._tasks_by_match.pop(match_id, set()):
+			if task is not current:
+				task.cancel()
+
+		if match is None:
+			return None
+
+		# 番号の二重返却を防ぐため、実際にマッチを破棄したときだけ返す
+		if match_id.startswith("M") and match_id[1:].isdigit():
+			heapq.heappush(self._available_match_numbers, int(match_id[1:]))
+		for player_id in match.players:
+			self._pending_low_hand_confirmations.pop(player_id, None)
+			if self._active_match_by_client.get(player_id) == match_id:
+				self._active_match_by_client.pop(player_id, None)
+
+		return match
+
+	def get_stats(self) -> Dict[str, int]:
+		return {
+			"match_tasks": sum(len(t) for t in self._tasks_by_match.values()),
+			"pending_low_hand_confirmations": len(self._pending_low_hand_confirmations),
+			"confirmed_hand_matches": len(self._confirmed_hand_players_by_match),
+		}
 
 	def _clear_pending_confirmations_for_engine(self, engine: GameEngine) -> None:
 		for p in engine.state.players:
@@ -230,10 +308,18 @@ class GameSession:
 			async def _wait_and_start_deal() -> None:
 				await round_start_done.wait()
 				await dealing_phase_done.wait()
+				# 配牌の生成（別スレッド）の完了をイベントループを止めずに待つ。
+				# 通常は前局中に生成済みなので即座に進む。失敗時は _deal_tiles 内で再生成される。
+				try:
+					await asyncio.wrap_future(engine.prepare_next_deal())
+				except asyncio.CancelledError:
+					raise
+				except Exception:
+					pass
 				original_deal_tiles()
 
-			asyncio.create_task(_notify_round_start())
-			asyncio.create_task(_wait_and_start_deal())
+			self._spawn(match.match_id, _notify_round_start())
+			self._spawn(match.match_id, _wait_and_start_deal())
 
 		engine.on_round_start = _on_round_start
 		engine.on_round_end = self._create_task_callback(self.on_round_end, match.match_id)
@@ -248,7 +334,7 @@ class GameSession:
 					if new_status == RoundStatus.DEALING:
 						dealing_phase_done.set()
 
-			asyncio.create_task(_notify_phase_change())
+			self._spawn(match.match_id, _notify_phase_change())
 
 		engine.on_phase_change = _on_phase_change
 		engine._deal_tiles = lambda: None
@@ -272,7 +358,14 @@ class GameSession:
 			return_exceptions=True,
 		)
 
-		self._game_engines[match.match_id] = engine
+		async with self._lock:
+			# game_started 送信中にプレイヤーが切断した場合、マッチは破棄済み。
+			# ここでエンジンを登録すると誰も片付けないまま残るので中止する。
+			if self._matches.get(match.match_id) is not match:
+				logger.info("マッチ開始前に破棄済み: match_id=%s", match.match_id)
+				return
+			self._game_engines[match.match_id] = engine
+			self._last_activity_by_match[match.match_id] = time.monotonic()
 		logger.info("マッチ開始: match_id=%s  players=%s", match.match_id, match.players)
 
 		opening_boosts = self._apply_opening_boosts(engine)
@@ -302,6 +395,7 @@ class GameSession:
 			return
 
 		engine = self._game_engines[match_id]
+		self.touch_match(match_id)
 		action_type = data.get("action")
 		action_data = data.get("data")
 
@@ -1141,12 +1235,7 @@ class GameSession:
 			)
 
 			async with self._lock:
-				self._game_engines.pop(match_id, None)
-				match = self._matches.pop(match_id, None)
-				if match_id.startswith("M") and match_id[1:].isdigit():
-					heapq.heappush(self._available_match_numbers, int(match_id[1:]))
-				for player_id in (match.players if match else []):
-					self._active_match_by_client.pop(player_id, None)
+				self.cleanup_match_locked(match_id)
 
 	async def on_phase_change(self, match_id: str, new_status: RoundStatus) -> None:
 		"""ラウンドステータス変更時の処理"""

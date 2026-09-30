@@ -4,15 +4,19 @@
 import logging
 import re
 from collections import Counter
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Callable, Optional
 import random
 
 from .game_state import GameState, RoundStatus, SkillType, PlayerState, get_skill_cost, get_bet_rule
-from .tile_wall import TileWall
+from .tile_wall import RoundDeal, generate_round_deal
 from .hand_analyzer import HandAnalyzer
 from .yaku import Yaku
 
 logger = logging.getLogger(__name__)
+
+# 配牌生成（満貫聴牌形の探索）を行うスレッド。全マッチで共有する。
+_DEAL_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="deal")
 
 
 class GameEngine:
@@ -26,7 +30,6 @@ class GameEngine:
             max_rounds: 最大ラウンド数（デフォルト25）
         """
         self.state = GameState()
-        self.tile_wall = TileWall()
         self.num_players = 2
         self.max_rounds = max_rounds
         self._carry_over_bets = False
@@ -34,6 +37,8 @@ class GameEngine:
         self._last_liquidation_result: Optional[dict] = None
         self._next_round_ready_players: set[str] = set()
         self._pending_agari: Optional[dict] = None
+        # 次局の配牌（バックグラウンドで生成中 or 生成済み）
+        self._next_deal: Optional[Future] = None
 
         # 各種コールバック
         # 準備フェーズ
@@ -69,9 +74,36 @@ class GameEngine:
         logger.info("ゲーム開始: max_rounds=%d", max_rounds)
         self._start_round()
 
+    def prepare_next_deal(self) -> Future:
+        """
+        次局の配牌をバックグラウンドで生成し始める。既に生成中・生成済みならそれを返す。
+        返り値の Future が完了していれば、_deal_tiles は待たずに配牌できる。
+        """
+        if self._next_deal is None:
+            self._next_deal = _DEAL_EXECUTOR.submit(generate_round_deal, self.num_players)
+        return self._next_deal
+
+    def _take_next_deal(self) -> RoundDeal:
+        """用意しておいた配牌を取り出す。未用意・生成失敗時はその場で生成する。"""
+        future, self._next_deal = self._next_deal, None
+        if future is not None:
+            try:
+                return future.result()
+            except Exception:
+                logger.exception("バックグラウンドの配牌生成に失敗したため、その場で生成します")
+        return generate_round_deal(self.num_players)
+
+    def dispose(self) -> None:
+        """マッチ破棄時に、未着手の配牌生成を取り消す。"""
+        if self._next_deal is not None:
+            self._next_deal.cancel()
+            self._next_deal = None
+
     def _start_round(self):
         """局を開始"""
         logger.info("局開始: round=%d", self.state.round_state.round_number)
+        # 1局目や先読みが間に合わなかった場合に備え、配牌の生成を先に始めておく
+        self.prepare_next_deal()
         self._invoke_callback(self.on_round_start)
 
         # 配牌を実行
@@ -80,27 +112,28 @@ class GameEngine:
 
     def _deal_tiles(self):
         """各プレイヤーに牌を配る"""
-        # 局ごとに牌山を再生成しないと、2局目以降で牌不足になる。
-        self.tile_wall.reset()
-        self.tile_wall.shuffle()
-
-        hands = [self.tile_wall.deal() for _ in range(self.num_players)]
+        # 局ごとに新しい牌山から配る（通常は局中に先読みした配牌を使う）
+        deal = self._take_next_deal()
+        hands = deal.hands
 
         # 配牌後に牌山へ残った実牌を MULLIGAN の交換候補にする。
-        self.state.round_state.reserved_tiles = list(self.tile_wall.tiles)
+        self.state.round_state.reserved_tiles = list(deal.reserved_tiles)
 
         def _to_wall_indexes(wall_tiles: list[int], hand_tiles: list[int]) -> list[int]:
             used = [False] * len(wall_tiles)
             indexes: list[int] = []
             for tile in hand_tiles:
                 tile_base = tile & 0b11111
-                found_idx = None
-                for idx, wall_tile in enumerate(wall_tiles):
-                    if used[idx]:
-                        continue
-                    if (wall_tile & 0b11111) == tile_base:
-                        found_idx = idx
-                        break
+                # ドラ/赤ドラを取り違えると翻数が変わり満貫を割るため、同一の牌を優先する
+                found_idx = next(
+                    (idx for idx, wall_tile in enumerate(wall_tiles) if not used[idx] and wall_tile == tile),
+                    None,
+                )
+                if found_idx is None:
+                    found_idx = next(
+                        (idx for idx, wall_tile in enumerate(wall_tiles) if not used[idx] and (wall_tile & 0b11111) == tile_base),
+                        None,
+                    )
                 if found_idx is None:
                     raise ValueError("deal が返した聴牌例を wall index へ変換できませんでした")
                 used[found_idx] = True
@@ -111,8 +144,11 @@ class GameEngine:
             player.wall = wall  # 配られた牌
             player.hand = _to_wall_indexes(wall, hand_tiles)  # 手牌例を wall index で保持
 
-        self.state.round_state.dora_id = self.tile_wall.dora_id
+        self.state.round_state.dora_id = deal.dora_id
         self._pending_agari = None
+
+        # 局中に次局の配牌を用意しておき、局開始時にすぐ配れるようにする
+        self.prepare_next_deal()
 
         self._invoke_callback(self.on_dealt)
 

@@ -11,12 +11,14 @@ import asyncio
 import heapq
 import json
 import logging
+import os
 import string
 import time
 import websockets
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 from .game_session import GameSession
+from ..utils.memory import current_rss_bytes, trim_malloc
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +46,12 @@ class WebSocketGameServer:
 	MAX_LOG_PAYLOAD_CHARS = 2000
 	PRIVATE_ROOM_PASSWORD_LENGTH = 5
 	PRIVATE_ROOM_PASSWORD_CHARS = string.ascii_uppercase + string.digits
+	# 最終操作からこの秒数が経過したマッチは放置とみなして破棄する
+	MATCH_IDLE_TIMEOUT_SEC = float(os.getenv("MATCH_IDLE_TIMEOUT_SEC", "1800"))
+	# 放置マッチの掃除・メモリ返却を行う間隔
+	HOUSEKEEPING_INTERVAL_SEC = 60.0
+	# 何回に1回、統計をログへ出すか（既定: 10分ごと）
+	STATS_LOG_EVERY = 10
 
 	def __init__(self, host: str = "127.0.0.1", port: int = 8765, max_players: int = 2):
 		self.host = host
@@ -52,6 +60,7 @@ class WebSocketGameServer:
 
 		self._server = None
 		self._websockets = None
+		self._housekeeping_task: Optional[asyncio.Task] = None
 		self._lock = asyncio.Lock()
 
 		self._connections: Set[Any] = set()
@@ -110,6 +119,7 @@ class WebSocketGameServer:
 
 		self._websockets = websockets
 		self._server = await websockets.serve(self._on_connect, self.host, self.port)
+		self.start_housekeeping()
 		logger.info("WebSocketGameServer started: ws://%s:%s", self.host, self.port)
 
 	async def stop(self) -> None:
@@ -120,6 +130,7 @@ class WebSocketGameServer:
 		self._server.close()
 		await self._server.wait_closed()
 		self._server = None
+		await self.stop_housekeeping()
 
 		for ws in list(self._connections):
 			await self._safe_close(ws)
@@ -136,6 +147,75 @@ class WebSocketGameServer:
 		self.game_engines.clear()
 
 		logger.info("WebSocketGameServer stopped")
+
+	def start_housekeeping(self) -> None:
+		"""放置マッチの掃除とメモリ返却を行う定期タスクを起動する。"""
+		if self._housekeeping_task is None or self._housekeeping_task.done():
+			self._housekeeping_task = asyncio.create_task(self._housekeeping_loop())
+
+	async def stop_housekeeping(self) -> None:
+		task = self._housekeeping_task
+		self._housekeeping_task = None
+		if task is None:
+			return
+		task.cancel()
+		try:
+			await task
+		except asyncio.CancelledError:
+			pass
+
+	async def _housekeeping_loop(self) -> None:
+		tick = 0
+		while True:
+			await asyncio.sleep(self.HOUSEKEEPING_INTERVAL_SEC)
+			tick += 1
+			try:
+				await self._cancel_idle_matches()
+				trim_malloc()
+				if tick % self.STATS_LOG_EVERY == 0:
+					logger.info("server stats: %s", self.get_stats())
+			except Exception:
+				logger.exception("housekeeping failed")
+
+	async def _cancel_idle_matches(self) -> None:
+		"""一定時間操作のないマッチを破棄し、参加者に通知する。"""
+		notifications: List[tuple] = []
+		async with self._lock:
+			for match_id in self._game_session.find_idle_matches(self.MATCH_IDLE_TIMEOUT_SEC):
+				match = self._game_session.cleanup_match_locked(match_id)
+				if match is None:
+					continue
+				logger.info("放置マッチを破棄: match_id=%s players=%s", match_id, match.players)
+				payload = {
+					"type": "match_cancelled",
+					"data": {
+						"match_id": match_id,
+						"reason": "idle_timeout",
+					},
+				}
+				for cid in match.players:
+					notifications.append((self._socket_by_client_id.get(cid), payload))
+
+		if notifications:
+			await asyncio.gather(
+				*(self._send_json(ws, payload) for ws, payload in notifications if ws is not None),
+				return_exceptions=True,
+			)
+
+	def get_stats(self) -> Dict[str, Any]:
+		"""メモリリーク調査用の内部状態の件数。"""
+		rss = current_rss_bytes()
+		return {
+			"connections": len(self._connections),
+			"waiting_queue": len(self._waiting_queue),
+			"private_rooms": len(self._private_room_by_password),
+			"matches": len(self._matches),
+			"active_match_clients": len(self._active_match_by_client),
+			"game_engines": len(self.game_engines),
+			"asyncio_tasks": len(asyncio.all_tasks()),
+			"rss_mb": round(rss / (1024 * 1024), 1) if rss is not None else None,
+			**self._game_session.get_stats(),
+		}
 
 	async def wait_closed(self) -> None:
 		"""サーバー終了待ち"""
@@ -211,18 +291,13 @@ class WebSocketGameServer:
 			if password is not None:
 				self._private_room_by_password.pop(password, None)
 
-			# 対局中マッチから除外
+			# 対局中マッチから除外（エンジン・タスク・確認状態もまとめて破棄）
 			match_id = self._active_match_by_client.pop(client_id, None)
-			if match_id and match_id in self._matches:
-				match = self._matches.pop(match_id)
-				if match_id.startswith("M") and match_id[1:].isdigit():
-					heapq.heappush(self._available_match_numbers, int(match_id[1:]))
-				# ゲームエンジンもクリーンアップ
-				self.game_engines.pop(match_id, None)
+			match = self._game_session.cleanup_match_locked(match_id) if match_id else None
+			if match is not None:
 				other_players = [cid for cid in match.players if cid != client_id]
 
 				for other_id in other_players:
-					self._active_match_by_client.pop(other_id, None)
 					if other_id in self._socket_by_client_id and other_id not in self._waiting_queue:
 						requeue_targets.append(other_id)
 

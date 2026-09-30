@@ -2,7 +2,8 @@
 麻雀牌の定義と牌山管理
 """
 import random
-from typing import List
+from dataclasses import dataclass
+from typing import List, Tuple
 
 from .hand_analyzer import HandAnalyzer
 
@@ -75,11 +76,11 @@ class TileWall:
             dealt_tiles = self.tiles[:count]
             rest_tiles = self.tiles[count:]
 
-            # 配った 34 枚から満貫以上の聴牌形を探索
-            hands = HandAnalyzer.search_tenpai(dealt_tiles, rest_tiles, self.dora_id)
+            # 配った 34 枚から満貫以上の聴牌形を探索（ランダムな順で探し、1つ見つかれば十分）
+            hands = HandAnalyzer.search_tenpai(dealt_tiles, rest_tiles, self.dora_id, limit=1)
             if hands:
                 self.tiles = rest_tiles
-                return dealt_tiles, random.choice(hands)
+                return dealt_tiles, hands[0]
 
             # 見つからなければ同じ牌山を再シャッフルして再探索
             self.shuffle()
@@ -87,3 +88,22 @@ class TileWall:
     def reset(self):
         """牌山をリセット"""
         self._initialize_wall()
+
+
+@dataclass(frozen=True)
+class RoundDeal:
+    """1局分の配牌結果"""
+
+    hands: List[Tuple[List[int], List[int]]]  # プレイヤーごとの (配牌34枚, 聴牌例)
+    reserved_tiles: List[int]  # 配牌後に牌山へ残った牌（MULLIGAN の交換候補）
+    dora_id: int
+
+
+def generate_round_deal(num_players: int) -> RoundDeal:
+    """
+    新しい牌山から1局分の配牌を生成する。
+    状態を共有しないので、別スレッドから呼んでよい。
+    """
+    tile_wall = TileWall()  # 生成時に牌山の初期化とシャッフルを行う
+    hands = [tile_wall.deal() for _ in range(num_players)]
+    return RoundDeal(hands=hands, reserved_tiles=list(tile_wall.tiles), dora_id=tile_wall.dora_id)

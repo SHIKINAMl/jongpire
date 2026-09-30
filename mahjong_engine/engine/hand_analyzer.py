@@ -1,12 +1,18 @@
 """
 手牌の聴牌判定と役計算
 """
+import random
 from collections import Counter
 from functools import lru_cache
 from typing import List, Tuple, Generator
 from itertools import combinations
 
 from .yaku import Yaku
+
+# 各計算キャッシュの上限件数。
+# 上限なしだと配牌ごとの聴牌探索でキャッシュが増え続け、常時稼働のサーバーがメモリ切れで落ちる
+# (40回の配牌で約 590MB)。4096 件ならキャッシュ全体で約 20MB に収まり、配牌速度の低下は約 1 割。
+_CACHE_MAXSIZE = 4096
 
 
 class HandAnalyzer:
@@ -22,6 +28,8 @@ class HandAnalyzer:
         wall: List[int],
         agari_wall: List[int] | None = None,
         dora: int | None = None,
+        limit: int | None = None,
+        rng: random.Random | None = None,
     ) -> List[list[int]]:
         """
         34枚の山牌から聴牌形を検索する
@@ -33,6 +41,9 @@ class HandAnalyzer:
             wall: 山牌のリスト（34枚を想定）
             agari_wall: 和了判定に使う残り牌のリスト。指定時は満貫以上の聴牌形のみ返す
             dora: ドラの牌ID。agari_wall 指定時に利用する
+            limit: 指定時はランダムな順で探索し、この件数が見つかった時点で打ち切る。
+                配牌では満貫聴牌形が通常数千通りあり、全列挙は不要なため 1 を指定する
+            rng: limit 指定時の探索順に使う乱数生成器（未指定時は random モジュール）
 
         Returns:
             聴牌形のリスト
@@ -48,6 +59,14 @@ class HandAnalyzer:
 
         # 34枚から順番に面子候補を抽出
         mentsu = HandAnalyzer._extract_mentsu_dp(wall_counter, 0, 0)
+
+        if limit is not None:
+            # 最初に見つかったものが偏らないよう、面子・残り形の探索順をシャッフルする
+            shuffler = rng if rng is not None else random
+            mentsu = list(mentsu)
+            shuffler.shuffle(mentsu)
+            residual_catalog = list(residual_catalog)
+            shuffler.shuffle(residual_catalog)
 
         for pattern in mentsu:
             removed_wall_counter = HandAnalyzer._subtract_tiles(wall_counter, pattern)
@@ -72,6 +91,8 @@ class HandAnalyzer:
 
                 results.append(HandAnalyzer._decorate_hand_from_index(candidate, source_tile_index))
                 seen.add(candidate)
+                if limit is not None and len(results) >= limit:
+                    return results
 
         return results
 
@@ -163,39 +184,47 @@ class HandAnalyzer:
         return tuple(counts)
 
     @staticmethod
-    @lru_cache(maxsize=None)
+    @lru_cache(maxsize=_CACHE_MAXSIZE)
     def _extract_mentsu_dp(
         counter_tuple: Tuple[int, ...],
-        start_tile: int = 0,
+        start_key: int = 0,
         depth: int = 0,
     ) -> Tuple[Tuple[int, ...], ...]:
-        """面子3つ分の候補を DP で列挙する。"""
+        """
+        面子3つ分の候補を DP で列挙する。
+
+        面子を key = 牌ID * 2 + (0: 刻子, 1: 順子) で表し、key が減らない順に選ぶ。
+        これで同じ面子の組を重複なく列挙しつつ、次の形も漏らさない。
+        - 1萬 (牌ID 0) から始まる面子
+        - 同じ面子の繰り返し（一盃口など）
+        - 3枚以上ある牌からの順子
+        """
         if depth == 3:
             return ((),)
 
         results: list[Tuple[int, ...]] = []
-        for tile_id in range(start_tile + 1, HandAnalyzer.TILE_KIND_COUNT):
-            if counter_tuple[tile_id] <= 0:
-                continue
+        for key in range(start_key, HandAnalyzer.TILE_KIND_COUNT * 2):
+            tile_id, is_run = divmod(key, 2)
 
-            if counter_tuple[tile_id] >= 3:
-                next_counter = list(counter_tuple)
-                next_counter[tile_id] -= 3
-                for melds in HandAnalyzer._extract_mentsu_dp(tuple(next_counter), tile_id, depth + 1):
-                    results.append((tile_id, tile_id, tile_id) + melds)
+            if is_run:
+                if not HandAnalyzer._can_form_run_from_tuple(counter_tuple, tile_id) or counter_tuple[tile_id] <= 0:
+                    continue
+                meld = (tile_id, tile_id + 1, tile_id + 2)
+            else:
+                if counter_tuple[tile_id] < 3:
+                    continue
+                meld = (tile_id, tile_id, tile_id)
 
-            elif HandAnalyzer._can_form_run_from_tuple(counter_tuple, tile_id):
-                next_counter = list(counter_tuple)
-                next_counter[tile_id] -= 1
-                next_counter[tile_id + 1] -= 1
-                next_counter[tile_id + 2] -= 1
-                for melds in HandAnalyzer._extract_mentsu_dp(tuple(next_counter), tile_id, depth + 1):
-                    results.append((tile_id, tile_id + 1, tile_id + 2) + melds)
+            next_counter = list(counter_tuple)
+            for t in meld:
+                next_counter[t] -= 1
+            for melds in HandAnalyzer._extract_mentsu_dp(tuple(next_counter), key, depth + 1):
+                results.append(meld + melds)
 
         return tuple(results)
 
     @staticmethod
-    @lru_cache(maxsize=None)
+    @lru_cache(maxsize=_CACHE_MAXSIZE)
     def _select_tiles_dp(
         counter_tuple: Tuple[int, ...],
         pick_count: int,
@@ -220,7 +249,7 @@ class HandAnalyzer:
         return tuple(results)
 
     @staticmethod
-    @lru_cache(maxsize=None)
+    @lru_cache(maxsize=_CACHE_MAXSIZE)
     def _get_waiting_tiles_from_counter(
         hand_counter: Tuple[int, ...],
         skip_tiles: Tuple[int, ...],
@@ -240,7 +269,7 @@ class HandAnalyzer:
         return tuple(waiting_tiles)
 
     @staticmethod
-    @lru_cache(maxsize=None)
+    @lru_cache(maxsize=_CACHE_MAXSIZE)
     def _get_waiting_tiles_for_residual(
         residual_counter: Tuple[int, ...],
         skip_tiles: Tuple[int, ...],
@@ -260,7 +289,7 @@ class HandAnalyzer:
         return tuple(waiting_tiles)
 
     @staticmethod
-    @lru_cache(maxsize=None)
+    @lru_cache(maxsize=_CACHE_MAXSIZE)
     def _is_win_tuple(counter_tuple: Tuple[int, ...]) -> bool:
         """牌種カウントタプルから和了形かどうかを判定する。"""
         if HandAnalyzer._is_titoitsu_tuple(counter_tuple):
@@ -278,7 +307,7 @@ class HandAnalyzer:
         return False
 
     @staticmethod
-    @lru_cache(maxsize=None)
+    @lru_cache(maxsize=_CACHE_MAXSIZE)
     def _is_meld_plus_head(counter_tuple: Tuple[int, ...]) -> bool:
         """5枚が 1 面子 + 1 雀頭へ分解できるかを判定する。"""
         for tile_id, count in enumerate(counter_tuple):
@@ -293,7 +322,7 @@ class HandAnalyzer:
         return False
 
     @staticmethod
-    @lru_cache(maxsize=None)
+    @lru_cache(maxsize=_CACHE_MAXSIZE)
     def _is_single_meld(counter_tuple: Tuple[int, ...]) -> bool:
         """3枚がちょうど1面子かどうかを判定する。"""
         tile_id = None
@@ -317,7 +346,7 @@ class HandAnalyzer:
         )
 
     @staticmethod
-    @lru_cache(maxsize=None)
+    @lru_cache(maxsize=_CACHE_MAXSIZE)
     def _can_form_all_melds(counter_tuple: Tuple[int, ...]) -> bool:
         """残り牌がすべて面子へ分解できるかを DP で判定する。"""
         tile_id = None
@@ -544,7 +573,7 @@ class HandAnalyzer:
         return HandAnalyzer._check_mangan_from_counter_tuple(counter_tuple, winning_tile, bonus_han)
 
     @staticmethod
-    @lru_cache(maxsize=None)
+    @lru_cache(maxsize=_CACHE_MAXSIZE)
     def _check_mangan_from_counter_tuple(
         counter_tuple: Tuple[int, ...],
         winning_tile: int | None,
@@ -559,7 +588,7 @@ class HandAnalyzer:
         return HandAnalyzer._max_han_from_counter_tuple(counter_tuple, winning_tile) >= target
 
     @staticmethod
-    @lru_cache(maxsize=None)
+    @lru_cache(maxsize=_CACHE_MAXSIZE)
     def _max_han_from_counter_tuple(
         counter_tuple: Tuple[int, ...],
         winning_tile: int | None,
