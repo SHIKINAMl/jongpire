@@ -1,0 +1,149 @@
+{
+  "easy": {
+    "brain": "easy",
+    "think_time": {
+      "hand_selection": [2.0, 4.0],
+      "skill": [0.8, 1.5],
+      "bet": [1.0, 2.0],
+      "discard": [0.8, 2.0],
+      "agari": [0.3, 0.6],
+      "next_round": [0.5, 1.0]
+    },
+    "perks": {
+      "initial_perspective_count": 0,
+      "opening_boost_count": 1,
+      "boost_hand_targets": 1,
+      "skill_cost_rate": 1.0
+    },
+    "hand_selection": {
+      "candidate_limit": 30,
+      "search_time_limit": 1.0,
+      "weight_han_multiplier": 1.0,
+      "weight_wait_count": 1.0,
+      "penalty_wait_in_own_wall": 0.5,
+      "bonus_wait_seen_in_opponent_wall": 0.0,
+      "strong_hand_score": 8.0
+    },
+    "skill": {
+      "min_health_after_use": 8000,
+      "mulligan": {"enabled": true, "max_strength": 0.4, "max_uses_per_round": 1},
+      "perspective": {"enabled": true, "min_health": 20000, "max_uses_per_round": 1, "value": 0},
+      "assault": {"enabled": true, "min_han": 8, "kill_ratio": 0},
+      "boost_hand": {"enabled": true, "min_health": 25000, "min_gain_ratio": 0}
+    },
+    "bet": {
+      "min_multiplier_to_raise": 1.0,
+      "steps": [
+        {"min_strength": 0.0, "bet_ratio": 0.0},
+        {"min_strength": 0.6, "bet_ratio": 0.2},
+        {"min_strength": 0.85, "bet_ratio": 0.4}
+      ],
+      "health_lead_factor": 0.0
+    },
+    "discard": {
+      "weight_genbutsu": 100,
+      "weight_own_wait": -50,
+      "weight_danger": -10,
+      "danger_honor": 0.3,
+      "danger_terminal": 0.6,
+      "danger_2_8": 0.8,
+      "danger_middle": 1.0,
+      "suji_factor": 0.5,
+      "weight_exposed_neighbor": 0.0
+    }
+  },
+  "normal": {
+    "extends": "hard",
+    "brain": "normal",
+    "think_time": {
+      "hand_selection": [1.5, 3.0],
+      "skill": [0.6, 1.2],
+      "bet": [0.8, 1.5],
+      "discard": [0.6, 1.5],
+      "agari": [0.3, 0.6],
+      "next_round": [0.5, 1.0]
+    }
+  },
+  "hard": {
+    "brain": "model",
+    "model_path": "",
+    "think_time": {
+      "hand_selection": [1.0, 2.0],
+      "skill": [0.4, 0.8],
+      "bet": [0.5, 1.0],
+      "discard": [0.5, 1.0],
+      "agari": [0.3, 0.6],
+      "next_round": [0.5, 1.0]
+    },
+    "perks": {
+      "initial_perspective_count": 0,
+      "opening_boost_count": 1,
+      "boost_hand_targets": 1,
+      "skill_cost_rate": 1.0
+    },
+    "hand_selection": {
+      "candidate_limit": 160,
+      "search_time_limit": 1.0,
+      "weight_han_multiplier": 1.0,
+      "weight_wait_count": 1.0,
+      "penalty_wait_in_own_wall": 0.5,
+      "bonus_wait_seen_in_opponent_wall": 0.3,
+      "strong_hand_score": 8.0
+    },
+    "skill": {
+      "min_health_after_use": 5000,
+      "value_margin": 0.8,
+      "stake_floor": 0,
+      "hp_risk": {"safe_health": 15000, "weight": 1.0},
+      "mulligan": {"enabled": true, "max_strength": 0.6, "max_uses_per_round": 2},
+      "perspective": {"enabled": true, "min_health": 0, "max_uses_per_round": 2, "value": 1000},
+      "assault": {"enabled": true, "min_han": 99, "kill_ratio": 1.0},
+      "boost_hand": {"enabled": true, "min_health": 15000, "min_gain_ratio": 0.3, "future_value_per_1000": 600, "future_rounds": 10, "future_decay": 0.5, "future_stake": 1000, "value_margin": 2.5},
+      "value_model": {
+        "perspective": {"intercept": -1520.72, "weights": {"available": 0.0, "boost_gain_ratio": 0.0, "dead_waits": 0.0, "duplicated_rest": 0.0, "expected_multiplier": 0.0, "max_multiplier": 0.0, "my_boosts": 0.0, "opp_boosts": 0.0, "opp_exposed_ratio": 0.0, "opp_unseen_best_suit": 60.284, "score": 0.0, "winning_waits": 0.0}, "repeat_factor": 0.651},
+        "mulligan": {"intercept": 1365.34, "weights": {"available": -69.862, "boost_gain_ratio": 0.0, "dead_waits": 0.0, "duplicated_rest": 0.0, "expected_multiplier": 0.0, "max_multiplier": -533.005, "my_boosts": 0.0, "opp_boosts": 0.0, "opp_exposed_ratio": 0.0, "opp_unseen_best_suit": 0.0, "score": 0.0, "winning_waits": 0.0}, "repeat_factor": 0.341},
+        "boost_hand": {"intercept": -1179.97, "weights": {"available": 0.0, "boost_gain_ratio": 1499.732, "dead_waits": 0.0, "duplicated_rest": 0.0, "expected_multiplier": 828.505, "max_multiplier": 0.0, "my_boosts": 0.0, "opp_boosts": 0.0, "opp_exposed_ratio": 0.0, "opp_unseen_best_suit": 0.0, "score": 0.0, "winning_waits": 0.0}}
+      }
+    },
+    "bet": {
+      "min_multiplier_to_raise": 1.0,
+      "steps": [
+        {"min_strength": 0.0, "bet_ratio": 0.0},
+        {"min_strength": 0.5, "bet_ratio": 0.15},
+        {"min_strength": 0.8, "bet_ratio": 0.4},
+        {"min_strength": 0.95, "bet_ratio": 0.7}
+      ],
+      "health_lead_factor": 0.1,
+      "edge_for_max_bet": 0.5,
+      "worst_loss_multiplier": 3.0,
+      "ruin_reserve": 2000,
+      "points_push": true,
+      "model": {
+        "win": {"intercept": -3.3853, "weights": {"available": 0.13155, "boost_gain_ratio": 0.0, "carry_over": 0.0, "dead_waits": 0.0, "duplicated_rest": 0.0, "expected_multiplier": 0.0, "max_multiplier": 0.0, "my_boosts": 0.0, "my_health": 0.0, "my_points": 0.0, "opp_boosts": 0.0, "opp_exposed_ratio": 2.91707, "opp_health": 0.0, "opp_points": 0.0, "opp_unseen_best_suit": 0.07749, "opp_used_assault": 0.0, "opp_used_boost_hand": 0.0, "opp_used_mulligan": 0.0, "opp_used_perspective": -0.31181, "score": 0.0, "winning_waits": 0.0}},
+        "lose": {"intercept": 2.5986, "weights": {"available": -0.0837, "boost_gain_ratio": 0.0, "carry_over": 0.0, "dead_waits": 0.10682, "duplicated_rest": 0.0, "expected_multiplier": 0.0, "max_multiplier": 0.0, "my_boosts": 0.0, "my_health": 0.0, "my_points": 0.0, "opp_boosts": 0.0, "opp_exposed_ratio": -3.54042, "opp_health": 0.0, "opp_points": 0.0, "opp_unseen_best_suit": -0.08671, "opp_used_assault": 0.0, "opp_used_boost_hand": 0.0, "opp_used_mulligan": -0.09739, "opp_used_perspective": 0.32893, "score": 0.0, "winning_waits": 0.0}},
+        "gain": {"intercept": -1.3981, "weights": {"available": 0.03119, "boost_gain_ratio": 0.13715, "carry_over": 0.0, "dead_waits": 0.0, "duplicated_rest": 0.0, "expected_multiplier": 1.14243, "max_multiplier": -0.19509, "my_boosts": -0.02137, "my_health": 0.5302, "my_points": -0.61859, "opp_boosts": 0.0, "opp_exposed_ratio": -1.73342, "opp_health": 0.0, "opp_points": 0.86201, "opp_unseen_best_suit": 0.03919, "opp_used_assault": 0.0, "opp_used_boost_hand": 0.0, "opp_used_mulligan": -0.06167, "opp_used_perspective": -0.05379, "score": -0.02036, "winning_waits": 0.0}},
+        "loss": {"intercept": 1.2709, "weights": {"available": 0.0, "boost_gain_ratio": 0.0, "carry_over": 0.0, "dead_waits": 0.0, "duplicated_rest": 0.0, "expected_multiplier": 0.0, "max_multiplier": 0.0, "my_boosts": 0.0, "my_health": 0.0, "my_points": 0.0, "opp_boosts": 0.15066, "opp_exposed_ratio": 0.0, "opp_health": 0.0, "opp_points": 0.0, "opp_unseen_best_suit": 0.0, "opp_used_assault": -0.33627, "opp_used_boost_hand": 2.83696, "opp_used_mulligan": -0.14196, "opp_used_perspective": 0.0, "score": 0.0, "winning_waits": 0.0}}
+      }
+    },
+    "discard": {
+      "weight_genbutsu": 100,
+      "weight_own_wait": -50,
+      "weight_danger": -10,
+      "danger_honor": 0.3,
+      "danger_terminal": 0.6,
+      "danger_2_8": 0.8,
+      "danger_middle": 1.0,
+      "suji_factor": 0.5,
+      "weight_exposed_neighbor": 1.5
+    }
+  },
+  "special": {
+    "extends": "normal",
+    "perks": {
+      "initial_perspective_count": 7,
+      "opening_boost_count": 3,
+      "boost_hand_targets": 2,
+      "skill_cost_rate": 0.6
+    }
+  }
+}

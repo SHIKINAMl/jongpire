@@ -1,7 +1,6 @@
 import asyncio
 import heapq
 import logging
-import random
 import time
 import traceback
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
@@ -9,6 +8,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 from ..engine.game_engine import GameEngine
 from ..engine.game_state import RoundStatus, SkillType, PlayerState
 from ..engine.hand_analyzer import HandAnalyzer
+from ..ai.cpu_controller import CpuController
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,8 @@ class GameSession:
 		self._tasks_by_match: Dict[str, Set[asyncio.Task]] = {}
 		# マッチごとの最終操作時刻（放置マッチの検出に使う）
 		self._last_activity_by_match: Dict[str, float] = {}
+		# CPU の席（client_id → CpuController）。CPU 宛ての通知は WebSocket ではなくここへ渡す
+		self._cpu_controllers: Dict[str, CpuController] = {}
 
 	async def _send_error(self, client_id: str, message: str) -> None:
 		"""クライアントへのエラー通知"""
@@ -167,6 +169,19 @@ class GameSession:
 		task.add_done_callback(_on_done)
 		return task
 
+	def spawn(self, match_id: str, coro: Awaitable[None]) -> asyncio.Task:
+		"""マッチに紐づくタスクを起動する（CPU から使う）。マッチの破棄時にまとめてキャンセルされる。"""
+		return self._spawn(match_id, coro)
+
+	def get_engine(self, match_id: str) -> Optional[GameEngine]:
+		return self._game_engines.get(match_id)
+
+	def get_cpu_controller(self, client_id: str) -> Optional[CpuController]:
+		return self._cpu_controllers.get(client_id)
+
+	def is_hand_selection_confirmed(self, match_id: str, client_id: str) -> bool:
+		return client_id in self._confirmed_hand_players_by_match.get(match_id, set())
+
 	def _create_task_callback(
 		self,
 		handler: Callable[..., Awaitable[None]],
@@ -202,6 +217,8 @@ class GameSession:
 			engine.dispose()
 		self._confirmed_hand_players_by_match.pop(match_id, None)
 		self._last_activity_by_match.pop(match_id, None)
+		for cpu_id in [cid for cid, cpu in self._cpu_controllers.items() if cpu.match_id == match_id]:
+			self._cpu_controllers.pop(cpu_id).stop()
 
 		# 自分自身（on_game_end など）はキャンセルしない
 		current = asyncio.current_task()
@@ -227,6 +244,7 @@ class GameSession:
 			"match_tasks": sum(len(t) for t in self._tasks_by_match.values()),
 			"pending_low_hand_confirmations": len(self._pending_low_hand_confirmations),
 			"confirmed_hand_matches": len(self._confirmed_hand_players_by_match),
+			"cpu_controllers": len(self._cpu_controllers),
 		}
 
 	def _clear_pending_confirmations_for_engine(self, engine: GameEngine) -> None:
@@ -251,27 +269,6 @@ class GameSession:
 		confirmed = self._confirmed_hand_players_by_match.get(match_id, set())
 		return len(confirmed) >= engine.num_players
 
-	def _apply_opening_boosts(self, engine: GameEngine) -> List[Dict[str, Any]]:
-		"""ゲーム開始時に各プレイヤーへ恒常強化を1つずつ付与する。"""
-		candidates = GameEngine.get_opening_boost_candidates()
-		if not candidates:
-			return []
-
-		assigned: List[Dict[str, Any]] = []
-		for player in engine.state.players:
-			yaku_name = random.choice(candidates)
-			if not engine.assign_opening_boost(player, yaku_name, bonus_han=1):
-				continue
-			assigned.append(
-				{
-					"client_id": player.player_id,
-					"yaku_name": yaku_name,
-					"bonus_han": 1,
-				}
-			)
-
-		return assigned
-
 	async def start_match(self, match: Any) -> None:
 		try:
 			await self._start_match_inner(match)
@@ -282,6 +279,12 @@ class GameSession:
 	async def _start_match_inner(self, match: Any) -> None:
 		engine = GameEngine(max_rounds=4)
 		engine.initialize_players(match.players)
+		cpu_profiles = match.cpu_profiles
+		for cpu_id, profile in cpu_profiles.items():
+			# 特典の項目名は PlayerState のフィールド名と同じ
+			engine.update_player_state(cpu_id, **profile.perks)
+			# game_started より前に登録しておく。開始前に人間が切断しても cleanup_match_locked で片付く
+			self._cpu_controllers[cpu_id] = CpuController(self, match.match_id, cpu_id, profile)
 		original_deal_tiles = engine._deal_tiles
 		round_start_done = asyncio.Event()
 		dealing_phase_done = asyncio.Event()
@@ -343,10 +346,13 @@ class GameSession:
 			"type": "game_started",
 			"data": {
 				"match_id": match.match_id,
+				"mode": match.mode,
 				"players": [
 					{
 						"client_id": cid,
 						"health": engine.state.players[idx].health,
+						"is_cpu": cid in cpu_profiles,
+						**({"cpu": cpu_profiles[cid].to_public_dict()} if cid in cpu_profiles else {}),
 					}
 					for idx, cid in enumerate(match.players)
 				],
@@ -368,7 +374,7 @@ class GameSession:
 			self._last_activity_by_match[match.match_id] = time.monotonic()
 		logger.info("マッチ開始: match_id=%s  players=%s", match.match_id, match.players)
 
-		opening_boosts = self._apply_opening_boosts(engine)
+		opening_boosts = engine.assign_random_opening_boosts()
 		if opening_boosts:
 			await self._broadcast_match_members(
 				match.match_id,
@@ -415,6 +421,7 @@ class GameSession:
 			"select": self._select,
 			"select_cancel": self._select_cancel,
 			"select_confirm": self._select_confirm,
+			"mulligan_select": self._mulligan_select,
 			"bet": self._bet,
 			"discard": self._discard,
 			"agari": self._agari,
@@ -432,6 +439,12 @@ class GameSession:
 			logger.error("アクション処理中に例外: client=%s  action=%s\n%s",
 				client_id, action_type, tb)
 			await self._send_error(client_id, f"Internal error while processing '{action_type}'")
+
+		# CPU は通知を受け取ったときに動く。CPU 宛ての通知がないまま状態が変わっても止まらないよう、
+		# 人間が何かしたら、同じマッチの CPU にやるべきことがないか確かめさせる
+		for cpu in list(self._cpu_controllers.values()):
+			if cpu.match_id == match_id and cpu.client_id != client_id:
+				cpu.wake()
 
 	def _serialize_round_state(self, engine: GameEngine) -> Dict[str, Any]:
 		round_state = engine.state.round_state
@@ -550,12 +563,11 @@ class GameSession:
 			await self._send_error(client_id, "Player not found")
 			return
 
-		cost = await self._execute_skill(engine, player, skill_type, action_data)
+		cost = engine.execute_skill(player, skill_type, action_data)
 
 		if cost is None:
 			try:
-				from ..engine.game_state import get_skill_cost
-				skill_cost = get_skill_cost(skill_type, player.special_victory_count)
+				skill_cost = engine.get_skill_cost(player, skill_type)
 				detail = f" (cost={skill_cost}, health={player.health})"
 			except Exception:
 				detail = ""
@@ -563,51 +575,44 @@ class GameSession:
 			return
 
 		# レスポンス（Python の snake_case を JSON のキャメルケースに変換）
+		data: Dict[str, Any] = {
+			"skillType": skill_type.value,
+			"cost": cost,
+			"currentHealth": player.health,
+		}
+		if skill_type == SkillType.MULLIGAN and player.pending_mulligan is not None:
+			# 候補は使った本人にだけ知らせる。mulligan_select で options の番号を 3 つ選んでもらう
+			data["mulliganOptions"] = {
+				"targetHandIndexes": list(player.pending_mulligan["wall_indexes"]),
+				"options": list(player.pending_mulligan["options"]),
+			}
+		await self._respond_to_client(client_id, {"type": "skill_accepted", "data": data})
+
+	async def _mulligan_select(self, engine: GameEngine, client_id: str, action_data: Dict[str, Any]) -> None:
+		"""
+		マリガンで手に入れる牌を選ぶ。choices は options の番号 3 つで、選んだ順に targetHandIndexes の位置へ入る
+		（[0, 1, 2] なら出した牌をそのまま残す）。
+		"""
+		if not await self._ensure_phase(engine, client_id, RoundStatus.HAND_SELECTION, "mulligan_select"):
+			return
+		player = engine.get_player_by_id(client_id)
+		if player is None:
+			await self._send_error(client_id, "Player not found")
+			return
+		result = engine.resolve_mulligan(player, action_data.get("choices"))
+		if result is None:
+			await self._send_error(client_id, "マリガンの選択待ちがないか、choices が不正です")
+			return
 		await self._respond_to_client(client_id, {
-			"type": "skill_accepted",
+			"type": "mulligan_selected",
 			"data": {
-				"skillType": skill_type.value,
-				"cost": cost,
-				"currentHealth": player.health,
+				"changes": [
+					{"wallIndex": c["wall_index"], "oldTile": c["old_tile"], "newTile": c["new_tile"]}
+					for c in result["changes"]
+				],
+				"wall": list(player.wall),
 			},
 		})
-
-	async def _execute_skill(self, engine: GameEngine, user: PlayerState, skill_type: SkillType, action_data: Dict[str, Any]) -> Optional[int]:
-		"""
-		スキルを実行（種別ごとの入力検証 + engine 呼び出し）
-
-		Returns:
-			HP コスト。失敗時は None
-		"""
-		if skill_type == SkillType.BOOST_HAND:
-			# 対象役名を検証
-			yaku_name = action_data.get("yaku_name")
-			normalized_yaku_name = GameEngine.normalize_boost_target_yaku_name(yaku_name)
-			if normalized_yaku_name is None:
-				return None
-			return engine.use_skill(user, skill_type, normalized_yaku_name)
-
-		elif skill_type == SkillType.SPECIAL_VICTORY:
-			return engine.use_skill(user, skill_type)
-
-		elif skill_type == SkillType.ASSAULT:
-			return engine.use_skill(user, skill_type)
-
-		elif skill_type == SkillType.PERSPECTIVE:
-			# 相手を取得
-			target = next((p for p in engine.state.players if p.player_id != user.player_id), None)
-			if target is None:
-				return None
-			return engine.use_skill_on_opponent(user, target, skill_type)
-
-		elif skill_type == SkillType.MULLIGAN:
-			# 交換対象インデックスを検証
-			target_index = action_data.get("target_hand_index")
-			if not isinstance(target_index, int) or target_index < 0 or target_index >= len(user.wall):
-				return None
-			return engine.use_mulligan(user, target_index)
-
-		return None
 
 	async def _select(self, engine: GameEngine, client_id: str, action_data: Dict[str, Any]) -> None:
 		"""手牌選択アクションの処理"""
@@ -622,6 +627,10 @@ class GameSession:
 		player = engine.get_player_by_id(client_id)
 		if player is None:
 			await self._send_error(client_id, "Player not found")
+			return
+
+		if player.pending_mulligan is not None:
+			await self._send_error(client_id, "マリガンの牌を選んでから手牌を確定してください")
 			return
 
 		wall_indexes = action_data.get("hand_indexes", action_data.get("hand"))
@@ -721,6 +730,10 @@ class GameSession:
 		validation_error = self._validate_hand_indexes(player.wall, wall_indexes)
 		if validation_error is not None:
 			await self._send_error(client_id, validation_error)
+			return
+
+		if player.pending_mulligan is not None:
+			await self._send_error(client_id, "マリガンの牌を選んでから手牌を確定してください")
 			return
 
 		pending = self._pending_low_hand_confirmations.get(client_id)
@@ -997,6 +1010,17 @@ class GameSession:
 			},
 		)
 
+		# 特典の初期透視（CPU のとくしゅ）は、配牌の直後に通常の透視と同じ形で知らせる
+		for reveal in self._game_engines[match_id].get_initial_perspective_reveals():
+			await self._broadcast_skill_casted(
+				match_id,
+				reveal["player_id"],
+				SkillType.PERSPECTIVE,
+				0,
+				{reveal["target_id"]: reveal["exposed_indexes"]},
+				source="cpu_perk",
+			)
+
 	async def on_selected(self, match_id: str) -> None:
 		"""手牌選択完了の処理"""
 		payload = [
@@ -1084,25 +1108,40 @@ class GameSession:
 
 	async def on_skill_casted(self, match_id: str, player_id: str, skill_type: SkillType, cost: int, exposed_indexes: Any) -> None:
 		"""スキル使用時の処理"""
+		await self._broadcast_skill_casted(match_id, player_id, skill_type, cost, exposed_indexes, source="skill")
+
+	async def _broadcast_skill_casted(
+		self,
+		match_id: str,
+		player_id: str,
+		skill_type: SkillType,
+		cost: int,
+		exposed_indexes: Any,
+		source: str,
+	) -> None:
+		"""
+		skill_casted を両者へ送る。
+
+		Args:
+			source: "skill"（スキルを使った）/ "cpu_perk"（CPU の特典による無料の発動）
+		"""
 		player = self._game_engines[match_id].get_player_by_id(player_id)
 
 		exposed_by_player: Dict[str, List[int]] = {}
 		exposed_flat: List[int] = []
+		# マリガンは相手に使ったことだけを知らせる（候補・選んだ牌は本人にだけ。mulliganResult は互換のため null）
 		mulligan_result: Optional[Dict[str, int]] = None
+		perspective_result: Optional[Dict[str, Any]] = None
 		if isinstance(exposed_indexes, dict):
-			raw_mulligan = exposed_indexes.get("__mulligan__")
-			if isinstance(raw_mulligan, dict):
-				try:
-					mulligan_result = {
-						"targetHandIndex": int(raw_mulligan["target_hand_index"]),
-						"oldTile": int(raw_mulligan["old_tile"]),
-						"newTile": int(raw_mulligan["new_tile"]),
-					}
-				except Exception:
-					mulligan_result = None
+			raw_perspective = exposed_indexes.get("__perspective__")
+			if isinstance(raw_perspective, dict):
+				perspective_result = {
+					"suit": raw_perspective.get("suit"),
+					"newlyExposedIndexes": list(raw_perspective.get("new_indexes", [])),
+				}
 
 			for cid, indexes in exposed_indexes.items():
-				if cid == "__mulligan__":
+				if cid in ("__mulligan__", "__perspective__"):
 					continue
 				try:
 					normalized = sorted(int(i) for i in indexes)
@@ -1129,6 +1168,8 @@ class GameSession:
 					"exposedHandIndexes": exposed_flat,
 					"exposedHandIndexesByPlayer": exposed_by_player,
 					"mulliganResult": mulligan_result,
+					"perspectiveResult": perspective_result,
+					"source": source,
 				},
 			},
 		)
@@ -1200,7 +1241,9 @@ class GameSession:
 		self._clear_hand_selection_confirmations(match_id)
 		if engine:
 			self._clear_pending_confirmations_for_engine(engine)
-			if any(p.health < 0 for p in engine.state.players):
+			if engine.game_end_reason is not None:
+				victory_method = engine.game_end_reason
+			elif any(p.health <= 0 for p in engine.state.players):
 				victory_method = "hp_zero"
 			elif any(p.cumulative_earned_points >= 30000 for p in engine.state.players):
 				victory_method = "cumulative_earned_points"
@@ -1220,7 +1263,7 @@ class GameSession:
 					"client_id": score_key,
 					"health": p.health,
 				})
-				if p.health < 0:
+				if p.health <= 0:
 					health_zero_players.append(score_key)
 
 			await self._broadcast_match_members(

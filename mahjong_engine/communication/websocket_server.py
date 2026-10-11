@@ -18,6 +18,7 @@ import websockets
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 from .game_session import GameSession
+from ..ai.cpu_config import DIFFICULTIES, CpuProfile, create_cpu_profile
 from ..utils.memory import current_rss_bytes, trim_malloc
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,8 @@ class MatchSession:
 	players: List[str] = field(default_factory=list)
 	status: str = "in_game"
 	created_at: float = field(default_factory=time.time)
+	mode: str = "public"  # "public" / "private" / "cpu"
+	cpu_profiles: Dict[str, CpuProfile] = field(default_factory=dict)  # CPU の席（client_id → 設定）
 
 	def to_dict(self) -> Dict[str, Any]:
 		return {
@@ -37,6 +40,7 @@ class MatchSession:
 			"players": list(self.players),
 			"status": self.status,
 			"created_at": self.created_at,
+			"mode": self.mode,
 		}
 
 
@@ -425,6 +429,10 @@ class WebSocketGameServer:
 			await self._join_private_room(client_id, join_data.get("password"))
 			return
 
+		if mode == "cpu":
+			await self._start_cpu_match(client_id, join_data.get("difficulty"))
+			return
+
 		await self._send_to_client(client_id, {"type": "error", "message": f"Unsupported join mode: {mode}"})
 
 	async def _enqueue_for_matchmaking(self, client_id: str) -> None:
@@ -448,6 +456,41 @@ class WebSocketGameServer:
 		await self._send_waiting_message(client_id, mode="public")
 		#await self._broadcast_matchmaking_state()
 		await self._try_make_match()
+
+	async def _start_cpu_match(self, client_id: str, difficulty: Any) -> None:
+		"""待ち行列に入れず、すぐ CPU とのマッチを作る。"""
+		if difficulty not in DIFFICULTIES:
+			await self._send_to_client(client_id, {"type": "error", "message": f"Unsupported difficulty: {difficulty}"})
+			return
+
+		# 設定ファイルはここで読み直す（書き換えは次のマッチから反映される）。全員が待つロックの外で読む
+		profile = create_cpu_profile(difficulty)
+
+		match: Optional[MatchSession] = None
+		async with self._lock:
+			if client_id in self._active_match_by_client:
+				await self._send_to_client(client_id, {"type": "error", "message": "Already in a match"})
+				return
+			if client_id in self._waiting_queue:
+				await self._send_to_client(client_id, {"type": "error", "message": "Already in matchmaking queue"})
+				return
+			if client_id in self._private_password_by_client:
+				await self._send_to_client(client_id, {"type": "error", "message": "Private room already created"})
+				return
+			if client_id not in self._socket_by_client_id:
+				await self._send_to_client(client_id, {"type": "error", "message": "Client not connected"})
+				return
+
+			match = self._create_match_locked([client_id])
+			# CPU の client_id はマッチ番号から作る。マッチ番号は同時に重ならないので CPU も重ならない
+			cpu_id = f"CPU{match.match_id[1:]}"
+			match.players.append(cpu_id)
+			match.mode = "cpu"
+			match.cpu_profiles[cpu_id] = profile
+			self._active_match_by_client[cpu_id] = match.match_id
+
+		logger.info("CPU マッチ作成: match_id=%s human=%s cpu=%s difficulty=%s", match.match_id, client_id, cpu_id, difficulty)
+		await self._game_session.start_match(match)
 
 	async def _create_private_room(self, client_id: str) -> None:
 		async with self._lock:
@@ -510,6 +553,7 @@ class WebSocketGameServer:
 			self._private_room_by_password.pop(password, None)
 			self._private_password_by_client.pop(host_id, None)
 			match = self._create_match_locked([host_id, client_id])
+			match.mode = "private"
 
 		if match is None:
 			return
@@ -600,6 +644,11 @@ class WebSocketGameServer:
 		await self._broadcast(payload)
 
 	async def _send_to_client(self, client_id: str, payload: Dict[str, Any]) -> None:
+		# CPU の席には WebSocket がない。人間と同じ通知を CPU へ直接渡す
+		cpu = self._game_session.get_cpu_controller(client_id)
+		if cpu is not None:
+			cpu.receive(payload)
+			return
 		websocket = self._socket_by_client_id.get(client_id)
 		await self._send_json(websocket, payload)
 

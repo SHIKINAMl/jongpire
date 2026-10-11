@@ -19,7 +19,7 @@ class RoundStatus(Enum):
 class SkillType(Enum):
     """プレイヤーが使用できるスキルの種別"""
     MULLIGAN = "mulligan"  # 手牌交換スキル
-    BOOST_HAND = "boost_hand"  # 指定役の翻数 +1
+    BOOST_HAND = "boost_hand"  # 指定役を含む和了の精算倍率を 1 段昇格（役ごとに 1 回）
     PERSPECTIVE = "perspective"  # 相手の手牌 3 枚を公開
     ASSAULT = "assault"  # 勝利時獲得点を0にし、同値を追加ダメージ化
     SPECIAL_VICTORY = "special_victory"  # 3 回目使用で勝利
@@ -27,12 +27,17 @@ class SkillType(Enum):
 
 # HP コスト・掛け金ルール統合テーブル
 # インデックスは special_victory_count に対応（0回 / 1回 / 2回以上）
+# コストはすべて 100 の倍数にする。
+# 0 回の行のマリガン・透視・役強化は暫定値（効果の測定から、掛け金 2500 前後で元が取れる額。
+# training/skill_value.py）。役強化は対局全体の測定（training/skill_game.py）で、3000 では勝率が +7% と
+# 安すぎたため上げた。その後、切りのいい数にそろえた（マリガン・透視 500、役強化 5000）。
+# 1 回・2 回以上の行はまだ見直していない
 HP_COST_TABLE: list[dict] = [
     {
         "skill_costs": {
-            SkillType.MULLIGAN: 1200,
-            SkillType.PERSPECTIVE: 1500,
-            SkillType.BOOST_HAND: 10000,
+            SkillType.MULLIGAN: 500,
+            SkillType.PERSPECTIVE: 500,
+            SkillType.BOOST_HAND: 5000,
             SkillType.ASSAULT: 3000,
             SkillType.SPECIAL_VICTORY: 30000,
         },
@@ -84,6 +89,27 @@ def get_skill_cost(skill_type: SkillType, special_victory_count: int) -> int:
     return HP_COST_TABLE[index]["skill_costs"][skill_type]
 
 
+# スキルコストの刻み（コストは常にこの倍数）
+COST_STEP = 100
+
+
+def apply_skill_cost_rate(cost: int, rate: float) -> int:
+    """
+    スキルコストに倍率を掛け、100 の倍数に丸める（例: 400 × 0.6 = 240 → 200、300 × 0.6 = 180 → 200）。
+    コストのあるスキルは 0 にならない（最低 100）。
+
+    Args:
+        cost: 倍率を掛ける前のコスト
+        rate: 倍率（1.0 なら変えない）
+
+    Returns:
+        倍率を掛けたあとのコスト
+    """
+    if cost <= 0:
+        return 0
+    return max(COST_STEP, int(cost * rate / COST_STEP + 0.5) * COST_STEP)
+
+
 def get_bet_rule(special_victory_count: int) -> tuple[int, int]:
     """
     掛け金ルール（上限, 単位）を取得
@@ -112,10 +138,20 @@ class PlayerState:
     base_bet: int = 0  # 流局持ち越し時に加算する基準掛け金（最初に設定した額）
     cumulative_earned_points: int = 0  # 勝利時の獲得量だけを足す累計点数
     special_victory_count: int = 0  # SPECIAL_VICTORY 累計使用回数（対局を通じて持続）
-    boost_hand_bonus: dict = field(default_factory=dict)  # 役強化ボーナス {役名: 追加翻数}（スキル/開始時付与を含み対局を通じて持続）
+    boost_hand_bonus: dict = field(default_factory=dict)  # 役強化ボーナス {役名: 1}。その役を含む和了の倍率を 1 段昇格（スキル/開始時付与を含み対局を通じて持続）
     exposed_hand_indexes: set = field(default_factory=set)  # PERSPECTIVE で公開された手牌インデックス（局ごとにリセット）
     assault_active_this_round: bool = False  # ASSAULT 発動済みなら、この局の和了時効果を有効化
     assault_used_this_round: bool = False  # ASSAULT の局内使用回数制限（1局1回）
+    # MULLIGAN の選択待ち（{"wall_indexes": 交換に出した位置 3 つ, "options": [出した 3 枚, 候補 3 枚]}）。局ごとにリセット
+    pending_mulligan: Optional[dict] = None
+    voltage_points: int = 0 # 現在のボルテージ値
+    voltage_broken: bool = False # ボルテージが継続中か
+    voltage_resume_points: int = 0 # ボルテージを再開するとき、どこから再開するのか
+    # CPU（とくしゅ）の特典。人間は既定値のまま（対局を通じて持続）
+    skill_cost_rate: float = 1.0  # スキルコストの倍率
+    boost_hand_targets: int = 1  # BOOST_HAND 1回で強化できる役の数
+    opening_boost_count: int = 1  # 開始時恒常強化の数
+    initial_perspective_count: int = 0  # 配牌時に無料で公開する相手の牌の枚数
 
 
 @dataclass

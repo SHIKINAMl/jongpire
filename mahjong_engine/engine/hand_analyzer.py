@@ -2,6 +2,7 @@
 手牌の聴牌判定と役計算
 """
 import random
+import time
 from collections import Counter
 from functools import lru_cache
 from typing import List, Tuple, Generator
@@ -30,6 +31,7 @@ class HandAnalyzer:
         dora: int | None = None,
         limit: int | None = None,
         rng: random.Random | None = None,
+        deadline: float | None = None,
     ) -> List[list[int]]:
         """
         34枚の山牌から聴牌形を検索する
@@ -44,6 +46,8 @@ class HandAnalyzer:
             limit: 指定時はランダムな順で探索し、この件数が見つかった時点で打ち切る。
                 配牌では満貫聴牌形が通常数千通りあり、全列挙は不要なため 1 を指定する
             rng: limit 指定時の探索順に使う乱数生成器（未指定時は random モジュール）
+            deadline: time.monotonic() の値。指定時はこの時刻を過ぎたら、それまでに見つかった分だけ返す。
+                候補が limit 件に満たない山では全列挙になり、数秒以上かかることがあるため
 
         Returns:
             聴牌形のリスト
@@ -69,6 +73,8 @@ class HandAnalyzer:
             shuffler.shuffle(residual_catalog)
 
         for pattern in mentsu:
+            if deadline is not None and time.monotonic() > deadline:
+                return results
             removed_wall_counter = HandAnalyzer._subtract_tiles(wall_counter, pattern)
             for rests, waits_all, sparse_counts in residual_catalog:
                 if any(removed_wall_counter[tile_id] < need for tile_id, need in sparse_counts):
