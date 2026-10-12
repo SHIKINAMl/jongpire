@@ -73,6 +73,11 @@ class MyView:
     boost_hand_targets: int
     can_mulligan: bool  # 交換用の予備牌が残っているか
     known_reserved: tuple[int, ...]  # マリガンで見て牌山に戻った牌（相手の山にはない）
+    skill_health_floor: int  # スキルを使った後に残さなければならない HP（流局の続きの局の積み上がった掛け金）
+    # ボルテージ（河から両者に分かる）: 点・切れているか・切れた後に再開する点
+    voltage_points: int
+    voltage_broken: bool
+    voltage_resume_points: int
 
 
 @dataclass(frozen=True)
@@ -132,6 +137,10 @@ def build_observation(engine: GameEngine, client_id: str, public: PublicInfo) ->
         boost_hand_targets=me.boost_hand_targets,
         can_mulligan=bool(round_state.reserved_tiles),
         known_reserved=tuple(public.known_reserved),
+        skill_health_floor=engine.skill_health_floor(me),
+        voltage_points=me.voltage_points,
+        voltage_broken=me.voltage_broken,
+        voltage_resume_points=me.voltage_resume_points,
     )
 
     opponent_view = OpponentView(

@@ -22,7 +22,8 @@
       "weight_wait_count": 1.0,
       "penalty_wait_in_own_wall": 0.5,
       "bonus_wait_seen_in_opponent_wall": 0.0,
-      "strong_hand_score": 8.0
+      "strong_hand_score": 8.0,
+      "tanki_bonus": 0.0
     },
     "skill": {
       "min_health_after_use": 8000,
@@ -49,7 +50,8 @@
       "danger_2_8": 0.8,
       "danger_middle": 1.0,
       "suji_factor": 0.5,
-      "weight_exposed_neighbor": 0.0
+      "weight_exposed_neighbor": 0.0,
+      "weight_voltage": 0.0
     }
   },
   "normal": {
@@ -66,7 +68,7 @@
   },
   "hard": {
     "brain": "model",
-    "model_path": "",
+    "model_path": "models/hard.npz",
     "think_time": {
       "hand_selection": [1.0, 2.0],
       "skill": [0.4, 0.8],
@@ -88,7 +90,8 @@
       "weight_wait_count": 1.0,
       "penalty_wait_in_own_wall": 0.5,
       "bonus_wait_seen_in_opponent_wall": 0.3,
-      "strong_hand_score": 8.0
+      "strong_hand_score": 8.0,
+      "tanki_bonus": 0.0
     },
     "skill": {
       "min_health_after_use": 5000,
@@ -134,7 +137,8 @@
       "danger_2_8": 0.8,
       "danger_middle": 1.0,
       "suji_factor": 0.5,
-      "weight_exposed_neighbor": 1.5
+      "weight_exposed_neighbor": 1.5,
+      "weight_voltage": 0.0
     }
   },
   "special": {

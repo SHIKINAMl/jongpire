@@ -6,6 +6,7 @@
 出力は人間のクライアントと同じ action の data。
 """
 import itertools
+import logging
 import math
 import random
 import time
@@ -13,10 +14,20 @@ from collections import Counter
 from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
-from ..engine.game_engine import MULLIGAN_CANDIDATE_COUNT, PERSPECTIVE_SUITS, GameEngine, promoted_multiplier, tiles_to_wall_indexes
+from ..engine.game_engine import (
+    MULLIGAN_CANDIDATE_COUNT,
+    PERSPECTIVE_SUITS,
+    GameEngine,
+    next_voltage,
+    promoted_multiplier,
+    tiles_to_wall_indexes,
+    voltage_multiplier,
+)
 from ..engine.hand_analyzer import HandAnalyzer
 from ..engine.game_state import SkillType
 from .observation import CpuObservation
+
+logger = logging.getLogger(__name__)
 
 HONOR_START = 27  # 牌種 27 以降は字牌（東・西）
 POINT_VICTORY = 30000  # 和了で得た累計点数がこれに届くと勝ち（GameEngine.end_round）
@@ -42,6 +53,7 @@ class WaitInfo:
     multiplier: float  # 満貫未満なら 0（和了れない）
     yaku: tuple[str, ...]
     available: float  # 和了れそうな枚数の見積もり
+    tanki: bool = False  # 単騎待ちボーナスの対象（待ちが 1 種類）。和了ると相手の損失が 2 倍
 
 
 @dataclass(frozen=True)
@@ -244,7 +256,9 @@ class RuleBrain:
                 + cfg["bonus_wait_seen_in_opponent_wall"] * ctx.held_exposed[kind]
                 - cfg["penalty_wait_in_own_wall"] * rest_counts[kind],
             )
-            waits.append(WaitInfo(kind, han, multiplier, tuple(yaku), available))
+            # 単騎待ちボーナスは、待ちが 1 種類なら形を問わず付く（GameEngine._is_tanki_wait_agari）
+            tanki = len(scored) == 1
+            waits.append(WaitInfo(kind, han, multiplier, tuple(yaku), available, tanki))
 
         score = self._score_waits(waits)
         if score is None:
@@ -258,8 +272,10 @@ class RuleBrain:
         winning = [w for w in waits if w.multiplier > 0]
         if not winning:
             return None
+        # 単騎は和了ると相手の損失が 2 倍になる分、tanki_bonus だけ高く見る
         return sum(
             (w.multiplier ** cfg["weight_han_multiplier"]) * (w.available ** cfg["weight_wait_count"])
+            * (1 + cfg["tanki_bonus"] if w.tanki else 1)
             for w in winning
         )
 
@@ -279,13 +295,17 @@ class RuleBrain:
             for combo in itertools.combinations(candidates, size):
                 boost_map = {**current, **{name: 1 for name in combo}}
                 boosted = [
-                    WaitInfo(w.kind, w.han, promoted_multiplier(w.han, list(w.yaku), boost_map), w.yaku, w.available)
+                    WaitInfo(w.kind, w.han, promoted_multiplier(w.han, list(w.yaku), boost_map), w.yaku, w.available, w.tanki)
                     for w in plan.waits
                 ]
                 score = self._score_waits(boosted) or 0.0
                 if score > best_score:
                     best_combo, best_score = combo, score
         return best_combo, best_score
+
+    def final_hand(self, obs: CpuObservation, plan: Optional[HandPlan]) -> list[int]:
+        """スキルを使い終えた後に確定する手牌（wall index）。規則では、点数がいちばん高い候補。"""
+        return list(plan.hand_indexes) if plan is not None else fallback_hand_indexes(obs)
 
     # ========== スキル ==========
 
@@ -360,7 +380,8 @@ class RuleBrain:
         return None
 
     def _can_afford(self, obs: CpuObservation, skill: str) -> bool:
-        reserve = self.config["skill"]["min_health_after_use"]
+        # 流局の続きの局では、積み上がった掛け金を払えなくなるほど使わない（サーバーも弾く）
+        reserve = max(self.config["skill"]["min_health_after_use"], obs.me.skill_health_floor)
         return obs.me.health - obs.me.skill_costs[skill] >= reserve
 
     def _uses(self, obs: CpuObservation, skill: str) -> int:
@@ -377,7 +398,7 @@ class RuleBrain:
         """
         cfg = self.config["skill"]
         carry = obs.carry_over_draw_count
-        bet = obs.me.bet if carry > 0 and obs.me.bet > 0 else self.choose_bet(obs, plan)
+        bet = obs.me.bet if carry > 0 and obs.me.bet > 0 else self.rule_bet(obs, plan)
         return max(bet, cfg["stake_floor"]) * (carry + 1)
 
     def estimate_skill_value(self, obs: CpuObservation, plan: HandPlan, skill: str) -> Optional[float]:
@@ -387,13 +408,21 @@ class RuleBrain:
         掛け金 1000 あたりの効果 = 切片 + Σ 重み × 判断材料（skill_features）。同じ局の 2 回目以降は
         repeat_factor を掛ける。それに、この局の掛け金 / 1000 を掛ける。
         """
+        per_1000 = self.skill_value_per_1000(obs, plan, skill)
+        if per_1000 is None:
+            return None
+        return per_1000 * self.skill_stake(obs, plan) / 1000
+
+    def skill_value_per_1000(
+        self, obs: CpuObservation, plan: HandPlan, skill: str, features: Optional[dict[str, float]] = None,
+    ) -> Optional[float]:
+        """掛け金 1000 あたりの効果の見積もり（2 回目以降は repeat_factor 込み）。見積もり式がなければ None。"""
         model = self._value_model(skill)
         if model is None:
             return None
-        features = self.skill_features(obs, plan)
+        features = features if features is not None else self.skill_features(obs, plan)
         per_1000 = model["intercept"] + sum(w * features.get(name, 0.0) for name, w in model["weights"].items())
-        per_1000 *= model["repeat_factor"] ** self._uses(obs, skill)
-        return per_1000 * self.skill_stake(obs, plan) / 1000
+        return per_1000 * model["repeat_factor"] ** self._uses(obs, skill)
 
     def effective_cost(self, obs: CpuObservation, skill: str) -> float:
         """
@@ -557,7 +586,7 @@ class RuleBrain:
             # 相手の損失は「相手の掛け金 × 倍率 + 強襲の追加ダメージ（自分の獲得）」。相手の掛け金はまだ分からない
             # ので最低額と見積もる。普通に和了れば累計獲得点数で勝てるなら使わない
             multiplier = plan.expected_multiplier
-            gain = self.choose_bet(obs, plan) * multiplier
+            gain = self.rule_bet(obs, plan) * multiplier
             opponent_loss_without = obs.me.bet_unit * multiplier
             if obs.me.cumulative_earned_points + gain >= POINT_VICTORY:
                 return None
@@ -569,6 +598,14 @@ class RuleBrain:
     # ========== 掛け金 ==========
 
     def choose_bet(self, obs: CpuObservation, plan: Optional[HandPlan]) -> int:
+        """この局の掛け金。"""
+        return self.rule_bet(obs, plan)
+
+    def rule_bet(self, obs: CpuObservation, plan: Optional[HandPlan]) -> int:
+        """
+        規則で決める掛け金。スキルの効果の見積もりなど、考え方の中で「賭ける予定の額」として使うのもこれ
+        （学習したモデルは choose_bet だけを置き換える）。
+        """
         cfg = self.config["bet"]
         unit = obs.me.bet_unit
         max_bet = min(obs.me.bet_max, obs.me.health // unit * unit)
@@ -645,6 +682,8 @@ class RuleBrain:
             return fallback_discard(obs)
 
         opponent_discard_kinds = {tile_kind(t) for t in obs.opponent.discards}
+        # どちらかの河に出た種類（ボルテージ: 出ていない種類を捨てると上がり、出た種類を捨てると切れる）
+        seen_kinds = opponent_discard_kinds | {tile_kind(obs.me.wall[i]) for i in obs.me.discarded_wall_indexes}
         my_waits = set(obs.me.waits)
         held_exposed = possibly_held_exposed_kinds(obs)
         # 公開牌が相手の手牌に入っている見込み。相手が捨て進めるほど、残った公開牌は手牌である可能性が高い
@@ -662,8 +701,20 @@ class RuleBrain:
             score += cfg["weight_danger"] * self._danger(
                 kind, opponent_discard_kinds, held_exposed, in_hand_probability, obs.opponent.complete_suits,
             )
+            score += cfg["weight_voltage"] * (self._voltage_potential(obs, kind not in seen_kinds) - 1.0)
             kind_scores[kind] = score
         return max(candidates, key=lambda i: kind_scores[tile_kind(obs.me.wall[i])] + self.rng.random() * 1e-3)
+
+    @staticmethod
+    def _voltage_potential(obs: CpuObservation, is_new_kind: bool) -> float:
+        """
+        その種類を捨てた後に見込めるボルテージの倍率。続いていればいまの倍率、切れていれば
+        次に初めての種類を捨てて再開したときの倍率（ボルテージは和了ったときの獲得額に掛かる）。
+        """
+        points, broken, resume = next_voltage(
+            obs.me.voltage_points, obs.me.voltage_broken, obs.me.voltage_resume_points, is_new_kind,
+        )
+        return voltage_multiplier(resume + 1 if broken else points)
 
     def _danger(
         self,
@@ -734,7 +785,21 @@ class RuleBrain:
 
 
 def create_brain(config: dict, rng: Optional[random.Random] = None) -> RuleBrain:
-    """設定の brain から考え方を作る。つよい（model）は学習済みモデルの用意ができるまで、ふつうで代わりに打つ。"""
+    """
+    設定の brain から考え方を作る。つよい（model）は、学習済みモデル（model_path）があればそれで打つ。
+    モデルがない・読めないときは、規則で打つ（設定はつよいのもの）。
+    """
     brain = config["brain"]
+    if brain == "model":
+        # numpy がない・モデルが読めないときも、マッチを止めずに規則で打つ
+        try:
+            from .model_brain import ModelBrain, model_available, resolve_model_path
+
+            path = resolve_model_path(config.get("model_path", ""))
+            if model_available(path):
+                return ModelBrain({**config, "model_path": str(path)}, rng, mode="greedy")
+            logger.warning("つよいのモデルがないので、規則で打ちます: %s", path)
+        except Exception:
+            logger.exception("つよいのモデルを使えないので、規則で打ちます")
     level = "easy" if brain == "easy" else "normal"
     return RuleBrain(level, config, rng)

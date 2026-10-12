@@ -568,7 +568,11 @@ class GameSession:
 		if cost is None:
 			try:
 				skill_cost = engine.get_skill_cost(player, skill_type)
-				detail = f" (cost={skill_cost}, health={player.health})"
+				floor = engine.skill_health_floor(player)
+				detail = f" (cost={skill_cost}, health={player.health}, floor={floor})"
+				if player.health >= skill_cost and player.health - skill_cost < floor:
+					# 流局の続きの局で、積み上がった掛け金を払えなくなる
+					detail += " 流局で積み上がった掛け金を払えなくなるため使えません"
 			except Exception:
 				detail = ""
 			await self._send_error(client_id, f"スキル '{skill_type.value}' の発動に失敗しました{detail}")
@@ -1255,6 +1259,8 @@ class GameSession:
 			final_scores = {}
 			player_healths = []
 			health_zero_players = []
+			# 掛け金を払えずに決着したときの、払えなかったプレイヤー（HP の多い方が払えないこともあるので、勝敗はこちらで決める）
+			bet_unpayable_players = []
 			for p in engine.state.players:
 				resolved_client_id = await self.resolve_client_id(match_id, p.player_id)
 				score_key = resolved_client_id if resolved_client_id is not None else str(p.player_id)
@@ -1265,6 +1271,8 @@ class GameSession:
 				})
 				if p.health <= 0:
 					health_zero_players.append(score_key)
+				if p.player_id in engine.bet_unpayable_players:
+					bet_unpayable_players.append(score_key)
 
 			await self._broadcast_match_members(
 				match_id,
@@ -1273,6 +1281,7 @@ class GameSession:
 					"final_scores": final_scores,
 					"player_healths": player_healths,
 					"health_zero_players": health_zero_players,
+					"bet_unpayable_players": bet_unpayable_players,
 					"victory_method": victory_method,
 				},
 			)

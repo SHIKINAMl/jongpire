@@ -92,6 +92,8 @@ _BUILTIN_CONFIG: dict[str, Any] = {
             "penalty_wait_in_own_wall": 0.5,
             "bonus_wait_seen_in_opponent_wall": 0.0,
             "strong_hand_score": 8.0,
+            # 単騎待ち（和了ると相手の損失が 2 倍）の待ちの点数を、1 + tanki_bonus 倍に見る
+            "tanki_bonus": 0.0,
         },
         "skill": {
             "min_health_after_use": 8000,
@@ -119,6 +121,7 @@ _BUILTIN_CONFIG: dict[str, Any] = {
             "danger_middle": 1.0,
             "suji_factor": 0.5,
             "weight_exposed_neighbor": 0.0,
+            "weight_voltage": 0.0,
         },
     },
     # ふつうは、つよいの設定を土台に、弱めた値だけを書く（人とのテストプレイで強すぎたときに下方修正する場所）。
@@ -130,7 +133,8 @@ _BUILTIN_CONFIG: dict[str, Any] = {
     },
     "hard": {
         "brain": "model",
-        "model_path": "",
+        # 学習したモデル（mahjong_engine/ai/ からの位置）。ファイルがなければ規則で打つ
+        "model_path": "models/hard.npz",
         "think_time": {
             "hand_selection": [1.0, 2.0],
             "skill": [0.4, 0.8],
@@ -151,6 +155,8 @@ _BUILTIN_CONFIG: dict[str, Any] = {
             "penalty_wait_in_own_wall": 0.5,
             "bonus_wait_seen_in_opponent_wall": 0.3,
             "strong_hand_score": 8.0,
+            # 単騎待ち（和了ると相手の損失が 2 倍）の待ちの点数を、1 + tanki_bonus 倍に見る
+            "tanki_bonus": 0.0,
         },
         "skill": {
             "min_health_after_use": 5000,
@@ -223,6 +229,8 @@ _BUILTIN_CONFIG: dict[str, Any] = {
             "danger_middle": 1.0,
             "suji_factor": 0.5,
             "weight_exposed_neighbor": 1.5,
+            # ボルテージ: 捨てた後に見込める倍率 − 1 にこの重みを掛けて足す（出ていない種類は上げ、出た種類は切る）
+            "weight_voltage": 0.0,
         },
     },
     "special": {

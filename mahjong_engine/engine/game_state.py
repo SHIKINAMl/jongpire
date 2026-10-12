@@ -142,6 +142,7 @@ class PlayerState:
     exposed_hand_indexes: set = field(default_factory=set)  # PERSPECTIVE で公開された手牌インデックス（局ごとにリセット）
     assault_active_this_round: bool = False  # ASSAULT 発動済みなら、この局の和了時効果を有効化
     assault_used_this_round: bool = False  # ASSAULT の局内使用回数制限（1局1回）
+    perspective_uses_this_round: int = 0  # PERSPECTIVE の局内使用回数（PERSPECTIVE_MAX_USES_PER_ROUND まで。特典の初期透視は数えない）
     # MULLIGAN の選択待ち（{"wall_indexes": 交換に出した位置 3 つ, "options": [出した 3 枚, 候補 3 枚]}）。局ごとにリセット
     pending_mulligan: Optional[dict] = None
     voltage_points: int = 0 # 現在のボルテージ値

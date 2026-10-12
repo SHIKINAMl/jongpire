@@ -27,6 +27,8 @@ PERSPECTIVE_SUITS: dict[str, range] = {
 }
 # 透視 1 回で公開する枚数
 PERSPECTIVE_REVEAL_COUNT = 3
+# 透視を 1 局に使える回数（1 人あたり）
+PERSPECTIVE_MAX_USES_PER_ROUND = 5
 # マリガンで交換に出す枚数・牌山から出す候補の枚数。
 # 自分の山から 3 枚を出し、出した 3 枚 + 候補 3 枚の 6 枚から 3 枚を選ぶ
 MULLIGAN_CANDIDATE_COUNT = 3
@@ -36,6 +38,33 @@ MULTIPLIER_TIERS = (1.0, 1.5, 2.0, 3.0, 4.0, 8.0)
 MULTIPLIER_TIER_LABELS = ("満貫", "跳満", "倍満", "三倍満", "役満", "ダブル役満")
 # 段階に届く最低の翻数
 _TIER_MIN_HAN = (4, 6, 8, 11, 13, 26)
+
+
+# ボルテージの段階（点 → 和了ったときの獲得額の倍率）と、連続が切れた後に再開する点
+_VOLTAGE_TIERS = ((14, 2.0), (9, 1.6), (5, 1.3), (2, 1.1), (0, 1.0))
+_VOLTAGE_RESUME = ((14, 9), (9, 5), (5, 2), (0, 0))
+VOLTAGE_MAX_POINTS = 14
+
+
+def voltage_multiplier(points: int) -> float:
+    """ボルテージの点から、勝者の獲得額の倍率を返す。"""
+    return next(rate for floor, rate in _VOLTAGE_TIERS if points >= floor)
+
+
+def voltage_resume_points(points: int) -> int:
+    """連続が切れたとき、次に初めての種類を捨てたら再開する点（の 1 つ手前）。"""
+    return next(resume for floor, resume in _VOLTAGE_RESUME if points >= floor)
+
+
+def next_voltage(points: int, broken: bool, resume: int, is_new_kind: bool) -> tuple[int, bool, int]:
+    """
+    1 枚捨てた後のボルテージ（点, 切れているか, 再開する点）。GameEngine._apply_voltage_discard と同じ規則。
+    どちらの河にもまだ出ていない種類を捨てると 1 点上がり（切れていたら再開する点から）、出た種類を捨てると切れる。
+    """
+    if is_new_kind:
+        start = resume if broken else points
+        return min(VOLTAGE_MAX_POINTS, start + 1), False, resume
+    return 0, True, voltage_resume_points(points)
 
 
 def han_to_tier(han: int) -> Optional[int]:
@@ -136,6 +165,8 @@ class GameEngine:
         # 次局の配牌（バックグラウンドで生成中 or 生成済み）
         self._next_deal: Optional[Future] = None
         self._deal_factory = deal_factory
+        # 掛け金を払えずに決着したときの、払えなかったプレイヤー（game_end で知らせる。HP の多い方が払えないこともある）
+        self.bet_unpayable_players: list[str] = []
         # この局の配牌時に特典で公開した牌（initial_perspective_count を持つプレイヤーの分）
         self._initial_perspective_reveals: list[dict] = []
         # 対局が終わった理由（game_end の victory_method になる）
@@ -275,16 +306,20 @@ class GameEngine:
 
         if self._carry_over_bets:
             # 流局後は同じ掛け金を維持し、ベットフェーズをスキップ
-            if not self._can_all_players_cover_carry_over_bet():
-                logger.warning("持ち越し掛け金を支払えないプレイヤーがいるためゲーム終了")
+            unpayable = self._players_unable_to_cover_carry_over_bet()
+            if unpayable:
+                logger.warning("持ち越し掛け金を支払えないプレイヤーがいるためゲーム終了: %s", unpayable)
+                self.bet_unpayable_players = unpayable
                 self._on_game_end("bet_unpayable")
                 return
             self.bet()
             return
 
         # 通常局は最低掛け金を支払えるかチェック
-        if not self._can_all_players_cover_min_bet():
-            logger.warning("最低掛け金を支払えないプレイヤーがいるためゲーム終了")
+        unpayable = self._players_unable_to_cover_min_bet()
+        if unpayable:
+            logger.warning("最低掛け金を支払えないプレイヤーがいるためゲーム終了: %s", unpayable)
+            self.bet_unpayable_players = unpayable
             self._on_game_end("bet_unpayable")
             return
 
@@ -307,6 +342,20 @@ class GameEngine:
     def get_bet_rule(self, player: PlayerState) -> tuple[int, int]:
         """プレイヤーの現在状態に対する掛け金ルール(上限, 単位)を返す。"""
         return get_bet_rule(player.special_victory_count)
+
+    def skill_health_floor(self, player: PlayerState) -> int:
+        """
+        スキルを使った後に残さなければならない HP。流局の続きの局では、積み上がった掛け金
+        （掛け金 × (流局の回数 + 1)）。それ以外は 0（掛け金はスキルの後に決めるので、払える額を賭ければよい）。
+        """
+        if not self._carry_over_bets:
+            return 0
+        return self.carry_over_stake(player, self._carry_over_draw_count)
+
+    @staticmethod
+    def carry_over_stake(player: PlayerState, draw_count: int) -> int:
+        """流局が draw_count 回続いた後の局で精算される掛け金（掛け金 × (流局の回数 + 1)）。"""
+        return player.bet * (draw_count + 1)
 
     def get_minimum_bet(self, player: PlayerState) -> int:
         """プレイヤーの現在状態に対する最低掛け金を返す。"""
@@ -338,22 +387,16 @@ class GameEngine:
         player.base_bet = bet_amount
         return True
 
-    def _can_all_players_cover_min_bet(self) -> bool:
-        """全プレイヤーが最低掛け金以上のHPを保持しているか。"""
-        for player in self.state.players:
-            required = self.get_minimum_bet(player)
-            if player.health < required:
-                player.health = 0
-                return False
-        return True
+    def _players_unable_to_cover_min_bet(self) -> list[str]:
+        """最低掛け金を HP で払えないプレイヤー。"""
+        return [p.player_id for p in self.state.players if p.health < self.get_minimum_bet(p)]
 
-    def _can_all_players_cover_carry_over_bet(self) -> bool:
-        """流局持ち越し時、全プレイヤーが前局掛け金以上のHPを保持しているか。"""
-        for player in self.state.players:
-            if player.health < player.bet:
-                player.health = 0
-                return False
-        return True
+    def _players_unable_to_cover_carry_over_bet(self) -> list[str]:
+        """流局持ち越し時、積み上がった掛け金（掛け金 × (流局の回数 + 1)）を HP で払えないプレイヤー。"""
+        return [
+            p.player_id for p in self.state.players
+            if p.health < self.carry_over_stake(p, self._carry_over_draw_count)
+        ]
 
     def select_hand(self, hand_indexes: list[int], player: PlayerState, force: bool = False) -> bool:
         """
@@ -507,6 +550,12 @@ class GameEngine:
                          user.player_id, skill_type.value, cost, user.health)
             return None
 
+        # 流局の続きの局では、積み上がった掛け金を払えなくなるほど HP を使えない（自滅を防ぐ）
+        if user.health - cost < self.skill_health_floor(user):
+            logger.debug("スキル 持ち越し掛け金を下回る: player=%s  skill=%s  cost=%d  health=%d  floor=%d",
+                         user.player_id, skill_type.value, cost, user.health, self.skill_health_floor(user))
+            return None
+
         # スキル固有の前提条件チェック
         validation_error = self._validate_skill_cast(user, skill_type, target, options)
         if validation_error:
@@ -579,6 +628,8 @@ class GameEngine:
         elif skill_type == SkillType.PERSPECTIVE:
             if target is None:
                 return True
+            if user.perspective_uses_this_round >= PERSPECTIVE_MAX_USES_PER_ROUND:
+                return True
             suit = options.get("suit")
             if suit is not None:
                 # 色を指定したときは、その色が相手の山に残っていなくても使える（全額払い、0 枚公開）
@@ -616,6 +667,7 @@ class GameEngine:
         elif skill_type == SkillType.PERSPECTIVE:
             # 使用者の牌は公開しない。相手（target）の山のうち、指定した色の未公開の牌から公開する
             # （色の指定がなければ山全体から。色を送らない古いクライアントのため）
+            user.perspective_uses_this_round += 1
             if target is not None and target.player_id != user.player_id and target.wall:
                 suit = options.get("suit")
                 before = set(target.exposed_hand_indexes)
@@ -765,20 +817,9 @@ class GameEngine:
         base_id = tile_id & 0b11111
         is_new = base_id not in self._voltage_seen_base_ids
         self._voltage_seen_base_ids.add(base_id)
-
-        if is_new:
-            if player.voltage_broken:
-                player.voltage_points = player.voltage_resume_points
-
-            player.voltage_points = min(14, player.voltage_points + 1)
-            player.voltage_broken = False
-            return
-
-        player.voltage_resume_points = self._get_voltage_resume_points(
-            player.voltage_points
+        player.voltage_points, player.voltage_broken, player.voltage_resume_points = next_voltage(
+            player.voltage_points, player.voltage_broken, player.voltage_resume_points, is_new,
         )
-        player.voltage_points = 0
-        player.voltage_broken = True
 
     def discard(self, player_id: str, wall_index: int) -> bool:
         """
@@ -949,15 +990,7 @@ class GameEngine:
 
     def _get_voltage_multiplier(self, points: int) -> float:
         """ボルテージポイントから勝者獲得額の倍率を返す。"""
-        if points >= 14:
-            return 2.0
-        if points >= 9:
-            return 1.6
-        if points >= 5:
-            return 1.3
-        if points >= 2:
-            return 1.1
-        return 1.0
+        return voltage_multiplier(points)
 
     def _get_voltage_level(self, points: int) -> int:
         """ボルテージポイントから段階番号を返す。0〜4。"""
@@ -973,33 +1006,19 @@ class GameEngine:
 
     def _get_voltage_resume_points(self, points: int) -> int:
         """ブレイク後、次の初出牌で再開するポイントを返す。"""
-        if points >= 14:
-            return 9
-        if points >= 9:
-            return 5
-        if points >= 5:
-            return 2
-        return 0
+        return voltage_resume_points(points)
 
-    def _is_tanki_wait_agari(self, hand: list[int], winning_tile: int, winner_waits: list[int]) -> bool:
-        """単騎待ちでの和了かどうかを判定する。"""
+    @staticmethod
+    def _is_tanki_wait_agari(hand: list[int], winning_tile: int, winner_waits: list[int]) -> bool:
+        """
+        単騎待ちボーナス（放銃した側の損失が 2 倍）の対象の和了か。
+        待ちが 1 種類だけで、その牌で和了ったとき。雀頭の待ちかどうかは問わない（嵌張・辺張の 1 種類待ちも含む）。
+        hand は判定に使わない（呼び出し側の形をそろえるために受け取る）。
+        """
         if winning_tile is None or not winner_waits:
             return False
-
-        winning_base = winning_tile & 0b11111
-        wait_bases = [wait & 0b11111 for wait in winner_waits]
-
-        # 単騎待ちは待ち牌が1種類で、その牌で和了している必要がある。
-        if len(set(wait_bases)) != 1 or wait_bases[0] != winning_base:
-            return False
-
-        counter = Counter(tile & 0b11111 for tile in hand)
-        if counter[winning_base] < 2:
-            return False
-
-        temp_counter = counter.copy()
-        temp_counter[winning_base] -= 2
-        return any(len(melds) == 4 for melds in HandAnalyzer._generate_melds(temp_counter))
+        wait_bases = {wait & 0b11111 for wait in winner_waits}
+        return wait_bases == {winning_tile & 0b11111}
 
     def _is_ippatsu_agari(self, winner: PlayerState, loser: PlayerState, base_yaku_list: list[str]) -> bool:
         """一発成立かどうかを返す。両者の一打目までを一発圏とする。"""
@@ -1254,14 +1273,17 @@ class GameEngine:
             self._on_game_end("cumulative_earned_points")
             return
 
-        # 次の局の掛け金（流局後は持ち越しの掛け金、それ以外は最低掛け金）を払えなければ、その場でゲーム終了。
-        # 次の局を始めてから手牌選択の後に気づくのでは遅い
+        # 次の局の掛け金を払えなければ、その場でゲーム終了。次の局を始めてから手牌選択の後に気づくのでは遅い。
+        # 流局後は、同じ掛け金が積み上がって「掛け金 × (流局の回数 + 1)」で精算される。掛け金は先払いしないので
+        # 流局しても HP は減らないが、積み上がった額を HP で払えなければ負け（先払いのころ、もう一度同じ額を
+        # 払えなければ負けだったのと同じ）。流局以外は最低掛け金
         unpayable = [
             p.player_id for p in self.state.players
-            if p.health < (p.bet if is_draw else self.get_minimum_bet(p))
+            if p.health < (self.carry_over_stake(p, self._carry_over_draw_count + 1) if is_draw else self.get_minimum_bet(p))
         ]
         if unpayable:
             logger.info("次局の掛け金を払えないためゲーム終了: players=%s is_draw=%s", unpayable, is_draw)
+            self.bet_unpayable_players = unpayable
             self._invoke_callback(self.on_round_end, is_draw)
             self._on_game_end("bet_unpayable")
             return

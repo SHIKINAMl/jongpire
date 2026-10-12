@@ -309,5 +309,5 @@ class CpuController:
                 plan = await loop.run_in_executor(_SEARCH_EXECUTOR, self._brain.replan, obs, plan, skill)
 
         self._plan = plan
-        hand_indexes = list(plan.hand_indexes) if plan is not None else fallback_hand_indexes(obs)
+        hand_indexes = self._brain.final_hand(obs, plan)
         await self._send_action("select", {"hand_indexes": hand_indexes})
