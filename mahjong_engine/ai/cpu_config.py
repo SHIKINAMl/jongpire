@@ -85,7 +85,8 @@ _BUILTIN_CONFIG: dict[str, Any] = {
         },
         "perks": dict(HUMAN_PERKS),
         "hand_selection": {
-            "candidate_limit": 30,
+            # ふつう（候補 40）に約 65% で負ける強さ（2026-10-14 に 30 → 20）
+            "candidate_limit": 20,
             "search_time_limit": 1.0,
             "weight_han_multiplier": 1.0,
             "weight_wait_count": 1.0,
@@ -130,6 +131,8 @@ _BUILTIN_CONFIG: dict[str, Any] = {
         "extends": "hard",
         "brain": "normal",
         "think_time": copy.deepcopy(_THINK_TIME_DEFAULT),
+        # 難易度の差をそろえる（ひとつ上の難易度に約 65% で負ける）。つよい（学習したモデル）に 65.7%
+        "hand_selection": {"candidate_limit": 40},
     },
     "hard": {
         "brain": "model",
