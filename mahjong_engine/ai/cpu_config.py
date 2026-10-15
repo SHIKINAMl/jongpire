@@ -61,6 +61,45 @@ HUMAN_PERKS = {
     "skill_cost_rate": 1.0,
 }
 
+# 選択の揺らぎ（RuleBrain / ModelBrain）。人間に決まった動きを読まれないようにする
+_VARIATION_DEFAULT = {
+    # 打牌: 点数（安全さ）に応じた確率で選ぶ温度。点数の差がこの値くらいなら、選ばれる確率は約 e 倍違う。
+    # 0 なら必ずいちばん安全な牌（前の動き）
+    "discard_temperature": 1.0,
+    # 手牌: いちばん高い点数との比に応じた確率で選ぶ温度（0.05 なら点数が 5% 低い候補は約 1/e の確率）
+    "hand_temperature": 0.05,
+    # 掛け金: 上限に対する割合の揺らぎ（標準偏差）
+    "bet_noise": 0.1,
+    # ブラフ: 弱い手で、この確率で上限の bluff_ratio 前後まで上げる
+    "bluff_rate": 0.1,
+    "bluff_ratio": 0.3,
+    # 強い手で、この確率で掛け金を半分に下げる（強い手を隠す）
+    "slowplay_rate": 0.1,
+    # スキル: 効果の見積もりに掛ける揺らぎ（対数の標準偏差）
+    "skill_noise": 0.2,
+    # つよい（学習したモデル）: ネットの確率をこの温度で鋭くしてから選ぶ。0 なら必ずいちばん確率の高い行動
+    "model_temperature": 0.3,
+}
+
+# 特定の戦術への対策・採用（tactics.py）。戦術ごとに同じ項目を持つ
+_TACTIC_DEFAULT = {
+    # 対策: 最初から、人間がこの戦術を使ってくると見込んで、その分類の牌の危険度に掛ける倍率
+    "counter_prior": 1.0,
+    # 対策: 相手がその分類でよく和了っていれば（目安の何倍か − 1）× この重みだけ危険度を上げる
+    "counter_weight": 0.0,
+    # 和了りが少ないうちに決めつけないよう、くせのない相手の和了りを何回分混ぜるか
+    "prior_strength": 4.0,
+    # 採用: 相手がその分類の牌を早く捨てるなら、その分類の待ちの価値を上げる重み
+    "adopt_weight": 0.0,
+    # 採用: 捨てたのを何枚見るまで、相手のくせを決めつけないか
+    "min_samples": 8,
+    # 倍率の上限
+    "max_multiplier": 3.0,
+}
+
+# 打牌の危険度の数え方（shape）の重み。待ちの形ごとの見込みに掛ける
+_SHAPE_WEIGHTS_DEFAULT = {"tanki": 2.0, "shanpon": 1.0, "sequence": 1.0}
+
 _THINK_TIME_DEFAULT = {
     "hand_selection": [1.5, 3.0],
     "skill": [0.6, 1.2],
@@ -123,7 +162,17 @@ _BUILTIN_CONFIG: dict[str, Any] = {
             "suji_factor": 0.5,
             "weight_exposed_neighbor": 0.0,
             "weight_voltage": 0.0,
+            # 危険度の数え方: table は牌種ごとの決まった値（danger_*）、shape は見えている枚数から数える
+            "danger_model": "table",
+            "shape_weights": dict(_SHAPE_WEIGHTS_DEFAULT),
+            "shape_scale": 1.0,
+            # 相手の透視で見られた自分の牌（狙われやすい）の危険度を 1 + この値 倍にする
+            "weight_seen_by_opponent": 0.0,
         },
+        # よわいは揺らぎを大きめにし（読みにくいが、いつも最善ではない）、ブラフ・戦術は使わない
+        "variation": {**_VARIATION_DEFAULT, "discard_temperature": 1.5, "hand_temperature": 0.1,
+                      "bluff_rate": 0.0, "slowplay_rate": 0.0, "model_temperature": 0.0},
+        "tactics": {"yaochu": dict(_TACTIC_DEFAULT)},
     },
     # ふつうは、つよいの設定を土台に、弱めた値だけを書く（人とのテストプレイで強すぎたときに下方修正する場所）。
     # つよいの設定は、強化学習のモデルができるまで規則で打つときの設定であり、学習の相手・手本にもする
@@ -234,6 +283,19 @@ _BUILTIN_CONFIG: dict[str, Any] = {
             "weight_exposed_neighbor": 1.5,
             # ボルテージ: 捨てた後に見込める倍率 − 1 にこの重みを掛けて足す（出ていない種類は上げ、出た種類は切る）
             "weight_voltage": 0.0,
+            # 危険度の数え方: shape は見えている枚数から、相手が待ちの形を手牌に持っていそうかを数える。
+            # table（決まった値）は一九字牌を一律に安全と見て早く捨てるので、人間に一九字牌待ちで狙われた
+            "danger_model": "shape",
+            "shape_weights": dict(_SHAPE_WEIGHTS_DEFAULT),
+            # shape の値をこれで割って、序盤の中張牌がおおむね 1 になるようにする
+            "shape_scale": 1.0,
+            # 相手の透視で見られた自分の牌は、相手がそれを待ちにしてくるので危険度を 1 + この値 倍にする
+            "weight_seen_by_opponent": 1.0,
+        },
+        "variation": dict(_VARIATION_DEFAULT),
+        "tactics": {
+            # 一九字牌待ち（2026-10 の人間とのテストプレイで使われた）
+            "yaochu": {**_TACTIC_DEFAULT, "counter_prior": 1.2, "counter_weight": 1.0, "adopt_weight": 0.5},
         },
     },
     "special": {
@@ -282,6 +344,26 @@ _RANGE_RULES: dict[str, Callable[[Any], bool]] = {
     "bet.ruin_reserve": _non_negative,
     "bet.steps.min_strength": _unit_interval,
     "bet.steps.bet_ratio": _unit_interval,
+    "discard.danger_model": lambda v: v in ("table", "shape"),
+    "discard.shape_scale": lambda v: v > 0,
+    "discard.shape_weights.tanki": _non_negative,
+    "discard.shape_weights.shanpon": _non_negative,
+    "discard.shape_weights.sequence": _non_negative,
+    "discard.weight_seen_by_opponent": _non_negative,
+    "variation.discard_temperature": _non_negative,
+    "variation.hand_temperature": _non_negative,
+    "variation.bet_noise": _non_negative,
+    "variation.bluff_rate": _unit_interval,
+    "variation.bluff_ratio": _unit_interval,
+    "variation.slowplay_rate": _unit_interval,
+    "variation.skill_noise": _non_negative,
+    "variation.model_temperature": _non_negative,
+    "tactics.yaochu.counter_prior": lambda v: v > 0,
+    "tactics.yaochu.counter_weight": _non_negative,
+    "tactics.yaochu.prior_strength": lambda v: v > 0,
+    "tactics.yaochu.adopt_weight": _non_negative,
+    "tactics.yaochu.min_samples": _non_negative,
+    "tactics.yaochu.max_multiplier": lambda v: v >= 1,
 }
 
 

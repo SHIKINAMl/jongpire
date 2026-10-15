@@ -103,6 +103,8 @@ class CpuController:
                 self._public.opponent_skills_this_round.append(skill)
                 if skill == "boost_hand":
                     self._public.opponent_boost_use_count += 1
+        elif msg_type == "round_end":
+            self._record_round_end(data.get("liquidation"))
         elif msg_type == "error":
             self._last_error = str(payload.get("message", data.get("message", "")))
         elif msg_type == "hand_selection_confirmation_required":
@@ -122,6 +124,18 @@ class CpuController:
             self._mulligan_options = None
 
         self.wake()
+
+    def _record_round_end(self, liquidation: Any) -> None:
+        """相手のくせ（和了った牌・捨てた順番）を覚える。局の状態は次局の準備まで残っている。"""
+        try:
+            engine = self._session.get_engine(self.match_id)
+            me = engine.get_player_by_id(self.client_id)
+            opponent = next(p for p in engine.state.players if p.player_id != self.client_id)
+            self._public.record_round_end(
+                self.client_id, me.discards, opponent.discards, liquidation if isinstance(liquidation, dict) else None,
+            )
+        except Exception:
+            logger.exception("相手のくせを覚えられませんでした: match=%s cpu=%s", self.match_id, self.client_id)
 
     def stop(self) -> None:
         """マッチの破棄時に呼ぶ。以後は何もしない。"""

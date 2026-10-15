@@ -10,7 +10,8 @@ RuleBrain（規則で打つつよい）をそのまま土台にし、勝ち負�
 
 ネットは小さな全結合（tanh）。重みは training/rl_train.py が .npz に書き出し、ここでは numpy で計算する。
 mode:
-- "greedy" … いちばん確率の高い行動（本番）
+- "greedy" … いちばん確率の高い行動（本番）。ただし variation.model_temperature が 0 より大きければ、
+  ネットの確率を温度で鋭くしてから確率どおりに選ぶ（毎回同じ行動にならず、人間に読まれにくい）
 - "sample" … 確率どおりに選ぶ（学習中のセルフプレイ）
 - "teacher" … 規則どおりに打ち、その行動を手本として記録する（模倣学習のデータ集め）
 recorder（リスト）を渡すと、判断ごとに入力・行動・確率を記録する（学習用）。
@@ -176,6 +177,11 @@ class ModelBrain(RuleBrain):
         logits = self.nets[head](x)
         if head == "hand":
             logits = logits.reshape(-1)
+        if self.mode == "greedy":
+            temperature = self.config["variation"]["model_temperature"]
+            if temperature > 0:
+                index, _ = _softmax_choice(np.asarray(logits) / temperature, mask, self.rng, sample=True)
+                return index, 0.0
         return _softmax_choice(logits, mask, self.rng, sample=self.mode == "sample")
 
     # ========== 手牌 ==========
@@ -260,7 +266,9 @@ class ModelBrain(RuleBrain):
         if self.mode == "teacher":
             return bet
         bet = unit + (max_bet - unit) * BET_LEVELS[index]
-        return max(unit, int(bet) // unit * unit)
+        bet = max(unit, int(bet) // unit * unit)
+        # 本番だけ、ブラフ・強い手で小さく賭けるのを混ぜる（選び方自体が揺れるので、細かい揺らぎは足さない）
+        return self.vary_bet(obs, plan, bet, noise=False) if self.mode == "greedy" else bet
 
 
 def resolve_model_path(path: str) -> Optional[Path]:

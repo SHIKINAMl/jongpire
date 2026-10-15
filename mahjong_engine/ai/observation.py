@@ -6,6 +6,8 @@ CPU が判断に使ってよい情報だけを詰める。エンジンの状態�
 見てよい情報（人間のクライアントが画面に出すものと同じ）:
 - 自分の山・聴牌例・手牌・待ち、ドラ
 - 相手の捨て牌（順番付き）、透視で公開された相手の牌
+- 相手の透視で公開された自分の牌（透視の結果は両者に通知される。相手に読まれている牌）
+- 対局を通して覚えた相手のくせ（和了った牌・捨てた順番。tactics.OpponentProfile）
 - 両者の HP、掛け金、公開された役強化、スキル使用の通知
 - 局数、流局の持ち越し回数
 
@@ -18,6 +20,7 @@ from typing import Optional
 
 from ..engine.game_engine import PERSPECTIVE_REVEAL_COUNT, GameEngine
 from ..engine.game_state import SkillType
+from .tactics import OpponentProfile
 
 # CPU が使うスキル（特殊勝利は使わない）
 CPU_SKILLS = (SkillType.MULLIGAN, SkillType.PERSPECTIVE, SkillType.BOOST_HAND, SkillType.ASSAULT)
@@ -35,6 +38,8 @@ class PublicInfo:
     complete_suits: set[str] = field(default_factory=set)
     # マリガンで見て牌山に戻った牌（牌ID）。牌山にあるので、相手の山にはない
     known_reserved: list[int] = field(default_factory=list)
+    # 対局を通して覚える相手のくせ（局が変わっても消さない）
+    opponent_profile: OpponentProfile = field(default_factory=OpponentProfile)
 
     def reset_round(self) -> None:
         self.opponent_skills_this_round = []
@@ -47,6 +52,17 @@ class PublicInfo:
         returned = Counter(pending["options"])
         returned.subtract(c["new_tile"] for c in changes)
         self.known_reserved.extend(returned.elements())
+
+    def record_round_end(self, my_id: str, my_discards, opponent_discards, liquidation: Optional[dict]) -> None:
+        """局の終わりに相手のくせを覚える。相手の和了り牌は、放銃した自分の最後の捨て牌。"""
+        my_discards = list(my_discards)
+        opponent_won = bool(liquidation) and liquidation.get("winner_id") not in (None, my_id)
+        self.opponent_profile.record_round(
+            opponent_discards,
+            opponent_won,
+            my_discards[-1] if opponent_won and my_discards else None,
+            bool(liquidation and liquidation.get("is_tanki_wait")),
+        )
 
     def record_my_perspective(self, suit: Optional[str], newly_exposed_count: int) -> None:
         """自分の透視の結果を覚える。規定の枚数より少なければ、その色はもう全部見えている。"""
@@ -73,6 +89,7 @@ class MyView:
     boost_hand_targets: int
     can_mulligan: bool  # 交換用の予備牌が残っているか
     known_reserved: tuple[int, ...]  # マリガンで見て牌山に戻った牌（相手の山にはない）
+    exposed_to_opponent: dict[int, int]  # 相手の透視で公開された自分の wall index → 牌ID（相手に読まれている牌）
     skill_health_floor: int  # スキルを使った後に残さなければならない HP（流局の続きの局の積み上がった掛け金）
     # ボルテージ（河から両者に分かる）: 点・切れているか・切れた後に再開する点
     voltage_points: int
@@ -107,7 +124,7 @@ class CpuObservation:
     i_am_first_player: bool  # 打牌フェーズの先手か（discard_phase_started で公開される）
     my_discard_count: int
     my_skills_this_round: dict[str, int]
-    # 翻数 → 精算倍率（ルールそのもので、状態を持たない）
+    opponent_profile: Optional[OpponentProfile] = None  # 対局を通して覚えた相手のくせ
 
 
 def build_observation(engine: GameEngine, client_id: str, public: PublicInfo) -> CpuObservation:
@@ -137,6 +154,7 @@ def build_observation(engine: GameEngine, client_id: str, public: PublicInfo) ->
         boost_hand_targets=me.boost_hand_targets,
         can_mulligan=bool(round_state.reserved_tiles),
         known_reserved=tuple(public.known_reserved),
+        exposed_to_opponent={idx: me.wall[idx] for idx in sorted(me.exposed_hand_indexes) if idx < len(me.wall)},
         skill_health_floor=engine.skill_health_floor(me),
         voltage_points=me.voltage_points,
         voltage_broken=me.voltage_broken,
@@ -168,4 +186,5 @@ def build_observation(engine: GameEngine, client_id: str, public: PublicInfo) ->
         i_am_first_player=engine.state.players[round_state.first_player_index].player_id == client_id,
         my_discard_count=len(me.discards),
         my_skills_this_round=dict(public.my_skills_this_round),
+        opponent_profile=public.opponent_profile,
     )

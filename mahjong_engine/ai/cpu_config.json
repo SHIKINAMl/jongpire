@@ -51,7 +51,24 @@
       "danger_middle": 1.0,
       "suji_factor": 0.5,
       "weight_exposed_neighbor": 0.0,
-      "weight_voltage": 0.0
+      "weight_voltage": 0.0,
+      "danger_model": "table",
+      "shape_weights": {"tanki": 2.0, "shanpon": 1.0, "sequence": 1.0},
+      "shape_scale": 1.0,
+      "weight_seen_by_opponent": 0.0
+    },
+    "variation": {
+      "discard_temperature": 1.5,
+      "hand_temperature": 0.1,
+      "bet_noise": 0.1,
+      "bluff_rate": 0.0,
+      "bluff_ratio": 0.3,
+      "slowplay_rate": 0.0,
+      "skill_noise": 0.2,
+      "model_temperature": 0.0
+    },
+    "tactics": {
+      "yaochu": {"counter_prior": 1.0, "counter_weight": 0.0, "prior_strength": 4.0, "adopt_weight": 0.0, "min_samples": 8, "max_multiplier": 3.0}
     }
   },
   "normal": {
@@ -139,7 +156,24 @@
       "danger_middle": 1.0,
       "suji_factor": 0.5,
       "weight_exposed_neighbor": 1.5,
-      "weight_voltage": 0.0
+      "weight_voltage": 0.0,
+      "danger_model": "shape",
+      "shape_weights": {"tanki": 2.0, "shanpon": 1.0, "sequence": 1.0},
+      "shape_scale": 1.0,
+      "weight_seen_by_opponent": 1.0
+    },
+    "variation": {
+      "discard_temperature": 1.0,
+      "hand_temperature": 0.05,
+      "bet_noise": 0.1,
+      "bluff_rate": 0.1,
+      "bluff_ratio": 0.3,
+      "slowplay_rate": 0.1,
+      "skill_noise": 0.2,
+      "model_temperature": 0.3
+    },
+    "tactics": {
+      "yaochu": {"counter_prior": 1.2, "counter_weight": 1.0, "prior_strength": 4.0, "adopt_weight": 0.5, "min_samples": 8, "max_multiplier": 3.0}
     }
   },
   "special": {

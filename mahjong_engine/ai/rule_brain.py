@@ -4,6 +4,12 @@
 規則ごとに点数を付け、点数の高い行動を選ぶ。重み・しきい値はすべて cpu_config.json から受け取る。
 入力は CpuObservation（視界）だけで、エンジンの状態は読まない。
 出力は人間のクライアントと同じ action の data。
+
+人間に読まれないように、選択には揺らぎを入れる（cpu_config.json の variation）:
+- 手牌・打牌は、点数に応じた確率で選ぶ（いちばん点数が高いものを必ず選ぶわけではない）
+- 掛け金は少し揺らし、ときどき弱い手で大きく賭け（ブラフ）、強い手で小さく賭ける
+- スキルは効果の見積もりを少し揺らす
+特定の戦術への対策・採用は tactics.py（cpu_config.json の tactics）。
 """
 import itertools
 import logging
@@ -26,6 +32,7 @@ from ..engine.game_engine import (
 from ..engine.hand_analyzer import HandAnalyzer
 from ..engine.game_state import SkillType
 from .observation import CpuObservation
+from .tactics import danger_multiplier, softmax_pick, wait_value_multiplier
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +42,7 @@ HAND_SIZE = 13
 OPPONENT_HAND_SIZE = 13
 # 相手が手牌に持つ牌と、待ちの牌種との近さ（同じ牌種 / 1 つ隣 / 2 つ隣）
 CLOSENESS_BY_DISTANCE = (1.0, 0.6, 0.3)
+TILE_KIND_COUNT = 29
 
 
 def tile_kind(tile: int) -> int:
@@ -150,6 +158,27 @@ class _HandContext:
     held_exposed: Counter
     known_reserved: Counter  # 牌山にあると分かっている牌（相手からは出てこない）
 
+@dataclass(frozen=True)
+class _DangerContext:
+    """打牌 1 回分の、牌種によらない値（牌種ごとに数え直さないため）。"""
+    opponent_discard_kinds: set[int]
+    held_exposed: Counter
+    in_hand_probability: float
+    hold_one: tuple[float, ...]  # 牌種ごとの、相手の手牌に 1 枚以上ある見込み
+    hold_two: tuple[float, ...]  # 牌種ごとの、相手の手牌に 2 枚以上ある見込み
+    seen_by_opponent: frozenset[int]  # 相手の透視で見られた、まだ捨てていない自分の牌種（狙われやすい）
+
+
+def dora_indicator_kind(dora: Optional[int]) -> Optional[int]:
+    """ドラから、牌山から 1 枚抜かれたドラ表示牌の牌種を逆算する（TileWall._initialize_wall の逆）。"""
+    if dora is None:
+        return None
+    dora = dora & 0b11111
+    if dora >= HONOR_START:
+        return 55 - dora  # 字牌は 東 → 西 → 東 の順
+    return (dora - 1) % 9 + (dora // 9) * 9
+
+
 # マリガンで手に入れる牌を選ぶときの、1 回の手牌探索の制限時間（秒）。組合せごとに探すので短くする
 MULLIGAN_SEARCH_TIME_LIMIT = 0.3
 # マリガンで手に入れる牌を選ぶときの、1 回の手牌探索の候補の数。20 通りを探すので、手牌選択（candidate_limit）より少なくする
@@ -181,14 +210,16 @@ class RuleBrain:
 
     def plan_hand(
         self, obs: CpuObservation, time_limit: Optional[float] = None, candidate_limit: Optional[int] = None,
+        sample: bool = True,
     ) -> Optional[HandPlan]:
         """
-        聴牌の候補を挙げて点数を付け、一番高いものを返す。満貫の候補がなければ None。
+        聴牌の候補を挙げて点数を付け、点数に応じた確率で 1 つ選ぶ（_best_of）。満貫の候補がなければ None。
         聴牌形の探索は重いので、イベントループの外（別スレッド）から呼ぶ。
 
         Args:
             time_limit: 探索の制限時間（秒）。省略すると設定の search_time_limit
             candidate_limit: 探す候補の数。省略すると設定の candidate_limit
+            sample: False ならいちばん点数の高い候補を選ぶ（マリガンの比較など、揺らぎが要らないとき）
         """
         cfg = self.config["hand_selection"]
         wall = list(obs.me.wall)
@@ -205,7 +236,7 @@ class RuleBrain:
             indexes = tiles_to_wall_indexes(wall, tiles)
             if indexes is not None and tuple(sorted(indexes)) not in candidates:
                 candidates.append(tuple(sorted(indexes)))
-        return self._best_of(obs, tuple(candidates))
+        return self._best_of(obs, tuple(candidates), sample)
 
     def replan(self, obs: CpuObservation, plan: Optional[HandPlan], skill: str) -> Optional[HandPlan]:
         """
@@ -220,16 +251,21 @@ class RuleBrain:
             return plan
         return self._best_of(obs, plan.candidates)
 
-    def _best_of(self, obs: CpuObservation, candidates: tuple[tuple[int, ...], ...]) -> Optional[HandPlan]:
+    def _best_of(
+        self, obs: CpuObservation, candidates: tuple[tuple[int, ...], ...], sample: bool = True,
+    ) -> Optional[HandPlan]:
+        """
+        候補に点数を付けて 1 つ選ぶ。sample なら、いちばん高い点数との比に応じた確率で選ぶ
+        （variation.hand_temperature。点数がほぼ同じ候補どうしは入れ替わり、待ちを読まれにくくなる）。
+        """
         ctx = self._context(obs)
-        best: Optional[HandPlan] = None
-        for indexes in candidates:
-            plan = self.evaluate_hand(obs, indexes, ctx=ctx)
-            if plan is not None and (best is None or plan.score > best.score):
-                best = plan
-        if best is None:
+        plans = [p for p in (self.evaluate_hand(obs, indexes, ctx=ctx) for indexes in candidates) if p is not None]
+        if not plans:
             return None
-        return HandPlan(best.hand_indexes, best.waits, best.score, best.strength, candidates)
+        top = max(p.score for p in plans)
+        temperature = self.config["variation"]["hand_temperature"] if sample else 0.0
+        chosen = plans[softmax_pick([p.score / max(top, 1e-9) for p in plans], temperature, self.rng)]
+        return HandPlan(chosen.hand_indexes, chosen.waits, chosen.score, chosen.strength, candidates)
 
     def evaluate_hand(
         self,
@@ -256,6 +292,8 @@ class RuleBrain:
                 + cfg["bonus_wait_seen_in_opponent_wall"] * ctx.held_exposed[kind]
                 - cfg["penalty_wait_in_own_wall"] * rest_counts[kind],
             )
+            # 戦術の採用: 相手が早く捨てる種類の牌を待ちにすると、早く和了れる
+            available *= wait_value_multiplier(kind, obs.opponent_profile, self.config["tactics"])
             # 単騎待ちボーナスは、待ちが 1 種類なら形を問わず付く（GameEngine._is_tanki_wait_agari）
             tanki = len(scored) == 1
             waits.append(WaitInfo(kind, han, multiplier, tuple(yaku), available, tanki))
@@ -438,9 +476,17 @@ class RuleBrain:
         return cost * margin * (1 + risk["weight"] * shortfall)
 
     def _worth_using(self, obs: CpuObservation, plan: HandPlan, skill: str, extra_value: float = 0.0) -> bool:
-        """見積もった効果（＋後の局まで続く分）が、判断に使うコスト以上か。"""
+        """
+        見積もった効果（＋後の局まで続く分）が、判断に使うコスト以上か。
+        見積もりは variation.skill_noise だけ揺らす（同じ状況で必ず同じスキルを使うと、手の強さを読まれる）。
+        """
         value = self.estimate_skill_value(obs, plan, skill)
-        return value is not None and value + extra_value >= self.effective_cost(obs, skill)
+        if value is None:
+            return False
+        noise = self.config["variation"]["skill_noise"]
+        if noise > 0:
+            value *= math.exp(self.rng.gauss(0.0, noise))
+        return value + extra_value >= self.effective_cost(obs, skill)
 
     def _decide_perspective(self, obs: CpuObservation, plan: HandPlan) -> Optional[dict[str, Any]]:
         cfg = self.config["skill"]["perspective"]
@@ -525,7 +571,7 @@ class RuleBrain:
     def _score_wall(self, obs: CpuObservation, wall: list[int]) -> float:
         """山がこうなったときの一番良い手牌の点数（満貫の手がなければ -inf）。"""
         plan = self.plan_hand(replace(obs, me=replace(obs.me, wall=tuple(wall))), time_limit=MULLIGAN_SEARCH_TIME_LIMIT,
-                              candidate_limit=MULLIGAN_CANDIDATE_LIMIT)
+                              candidate_limit=MULLIGAN_CANDIDATE_LIMIT, sample=False)
         return plan.score if plan is not None else float("-inf")
 
     def choose_mulligan(self, obs: CpuObservation, pending: dict) -> list[int]:
@@ -598,8 +644,37 @@ class RuleBrain:
     # ========== 掛け金 ==========
 
     def choose_bet(self, obs: CpuObservation, plan: Optional[HandPlan]) -> int:
-        """この局の掛け金。"""
-        return self.rule_bet(obs, plan)
+        """この局の掛け金。規則で決めた額に揺らぎ（ブラフなど）を入れる。"""
+        return self.vary_bet(obs, plan, self.rule_bet(obs, plan))
+
+    def vary_bet(self, obs: CpuObservation, plan: Optional[HandPlan], bet: int, noise: bool = True) -> int:
+        """
+        掛け金に揺らぎを入れる（variation）。掛け金から手の強さを読まれないようにする。
+        - ブラフ: 弱い手（strength < 0.5）で、bluff_rate の確率で上限の bluff_ratio 前後まで上げる
+        - 強い手（strength >= 0.8）で、slowplay_rate の確率で半分に下げる
+        - 上限に対する割合を bet_noise だけ揺らす（noise=False なら揺らさない。学習したモデルは選び方自体が揺れる）
+        上げるのは、放銃の悪い場合を払っても ruin_reserve が残る額まで（倒されないため）。
+        """
+        var = self.config["variation"]
+        unit = obs.me.bet_unit
+        max_bet = min(obs.me.bet_max, obs.me.health // unit * unit)
+        if plan is None or max_bet <= unit:
+            return bet
+        original = ratio = (bet - unit) / (max_bet - unit)
+        roll = self.rng.random()
+        if plan.strength < 0.5 and roll < var["bluff_rate"]:
+            ratio = max(ratio, var["bluff_ratio"] * self.rng.uniform(0.7, 1.3))
+        elif plan.strength >= 0.8 and roll < var["slowplay_rate"]:
+            ratio *= 0.5
+        if noise and var["bet_noise"] > 0:
+            ratio += self.rng.gauss(0.0, var["bet_noise"])
+        if ratio == original:
+            return bet  # 割合に戻して掛け直すと、端数の切り捨てで 1 単位下がることがある
+        varied = unit + (max_bet - unit) * _clamp(ratio, 0.0, 1.0) + 1e-6
+        cfg = self.config["bet"]
+        safe = (obs.me.health - cfg.get("ruin_reserve", 0)) / cfg.get("worst_loss_multiplier", 1.0)
+        varied = min(varied, max(bet, safe))
+        return max(unit, int(varied) // unit * unit)
 
     def rule_bet(self, obs: CpuObservation, plan: Optional[HandPlan]) -> int:
         """
@@ -676,61 +751,127 @@ class RuleBrain:
     # ========== 打牌 ==========
 
     def choose_discard(self, obs: CpuObservation) -> int:
+        """
+        捨てる牌（wall index）。牌種ごとに点数（安全さ）を付け、点数に応じた確率で選ぶ
+        （variation.discard_temperature。必ず同じ順に捨てると、人間に先読みされる）。
+        """
         cfg = self.config["discard"]
         candidates = rest_indexes(obs, obs.me.hand)
         if not candidates:
             return fallback_discard(obs)
 
-        opponent_discard_kinds = {tile_kind(t) for t in obs.opponent.discards}
+        dctx = self._danger_context(obs)
         # どちらかの河に出た種類（ボルテージ: 出ていない種類を捨てると上がり、出た種類を捨てると切れる）
-        seen_kinds = opponent_discard_kinds | {tile_kind(obs.me.wall[i]) for i in obs.me.discarded_wall_indexes}
+        seen_kinds = dctx.opponent_discard_kinds | {tile_kind(obs.me.wall[i]) for i in obs.me.discarded_wall_indexes}
         my_waits = set(obs.me.waits)
-        held_exposed = possibly_held_exposed_kinds(obs)
-        # 公開牌が相手の手牌に入っている見込み。相手が捨て進めるほど、残った公開牌は手牌である可能性が高い
-        undiscarded = max(OPPONENT_HAND_SIZE, obs.opponent.wall_size - len(obs.opponent.discards))
-        in_hand_probability = OPPONENT_HAND_SIZE / undiscarded
 
-        # 点数は牌種で決まるので、牌種ごとに 1 回だけ数える（同点の選び方だけは牌ごとに散らす）
-        kind_scores: dict[int, float] = {}
-        for kind in {tile_kind(obs.me.wall[i]) for i in candidates}:
+        # 点数は牌種で決まるので、牌種ごとに 1 回だけ数える
+        by_kind: dict[int, list[int]] = {}
+        for i in candidates:
+            by_kind.setdefault(tile_kind(obs.me.wall[i]), []).append(i)
+        kinds = sorted(by_kind)
+        scores: list[float] = []
+        for kind in kinds:
             score = 0.0
-            if kind in opponent_discard_kinds:
+            if kind in dctx.opponent_discard_kinds:
                 score += cfg["weight_genbutsu"]  # 相手が捨てた種類はフリテンで必ず安全
             if kind in my_waits:
                 score += cfg["weight_own_wait"]  # 自分の待ちを捨てると自分がフリテンになる
-            score += cfg["weight_danger"] * self._danger(
-                kind, opponent_discard_kinds, held_exposed, in_hand_probability, obs.opponent.complete_suits,
-            )
+            score += cfg["weight_danger"] * self.danger(kind, obs, dctx)
             score += cfg["weight_voltage"] * (self._voltage_potential(obs, kind not in seen_kinds) - 1.0)
-            kind_scores[kind] = score
-        return max(candidates, key=lambda i: kind_scores[tile_kind(obs.me.wall[i])] + self.rng.random() * 1e-3)
+            scores.append(score)
+        kind = kinds[softmax_pick(scores, self.config["variation"]["discard_temperature"], self.rng)]
+        return self.rng.choice(by_kind[kind])
 
-    @staticmethod
-    def _voltage_potential(obs: CpuObservation, is_new_kind: bool) -> float:
+    def _danger_context(self, obs: CpuObservation) -> _DangerContext:
         """
-        その種類を捨てた後に見込めるボルテージの倍率。続いていればいまの倍率、切れていれば
-        次に初めての種類を捨てて再開したときの倍率（ボルテージは和了ったときの獲得額に掛かる）。
-        """
-        points, broken, resume = next_voltage(
-            obs.me.voltage_points, obs.me.voltage_broken, obs.me.voltage_resume_points, is_new_kind,
-        )
-        return voltage_multiplier(resume + 1 if broken else points)
+        打牌 1 回分の材料。相手の手牌に各牌種が何枚ありそうかを、見えている枚数から数える。
 
-    def _danger(
-        self,
-        kind: int,
-        opponent_discard_kinds: set[int],
-        held_exposed: Counter,
-        in_hand_probability: float,
-        complete_suits: frozenset[str] = frozenset(),
-    ) -> float:
-        """その牌種が相手の待ちである見込み（0 なら安全）。"""
+        その牌種の残り = 4 枚（ドラ表示牌の種類は 3 枚）− 自分の山 − 牌山にあると分かっている牌
+                        − 相手の捨て牌 − 透視で見えた相手の牌（まだ捨てていないもの）
+        残りは「相手の山の見えていない所」か「牌山」にあり、相手の山の見えていない所にある割合は
+        その枠の数 / 残りの合計。相手の山の捨てていない牌のうち手牌は 13 枚（in_hand_probability）。
+        """
+        opponent = obs.opponent
+        discards = Counter(tile_kind(t) for t in opponent.discards)
+        held_exposed = possibly_held_exposed_kinds(obs)
+        undiscarded = max(OPPONENT_HAND_SIZE, opponent.wall_size - len(opponent.discards))
+        in_hand = OPPONENT_HAND_SIZE / undiscarded
+
+        own = Counter(tile_kind(t) for t in obs.me.wall)
+        reserved = Counter(tile_kind(t) for t in obs.me.known_reserved)
+        indicator = dora_indicator_kind(obs.dora_id)
+        hidden = [
+            max(0, 4 - (kind == indicator) - own[kind] - reserved[kind] - discards[kind] - held_exposed[kind])
+            for kind in range(TILE_KIND_COUNT)
+        ]
+        slots = max(0, opponent.wall_size - len(opponent.discards) - sum(held_exposed.values()))
+        pool = sum(hidden)
+        in_wall = min(1.0, slots / pool) if pool > 0 else 0.0
+
+        hold_one, hold_two = [], []
+        for kind in range(TILE_KIND_COUNT):
+            unseen_mean = in_hand * in_wall * hidden[kind]
+            mean = in_hand * held_exposed[kind] + unseen_mean
+            hold_one.append(1.0 - (1.0 - in_hand) ** held_exposed[kind] * math.exp(-unseen_mean))
+            hold_two.append(max(0.0, 1.0 - math.exp(-mean) * (1.0 + mean)))
+
+        rest = set(rest_indexes(obs, obs.me.hand))
+        seen = frozenset(tile_kind(t) for i, t in obs.me.exposed_to_opponent.items() if i in rest)
+        return _DangerContext(set(discards), held_exposed, in_hand, tuple(hold_one), tuple(hold_two), seen)
+
+    def danger(self, kind: int, obs: CpuObservation, dctx: _DangerContext) -> float:
+        """
+        その牌種を捨てたときに相手に和了られる見込み（0 なら安全。おおむね 0〜2）。
+
+        - 形の見込み（danger_model）: shape は枚数から数える（相手が待ちに要る牌を手牌に持っていそうか）。
+          table は牌種ごとの決まった値（よわい）
+        - 相手に読まれている牌: 相手の透視で見られた自分の牌は、狙われやすいので weight_seen_by_opponent だけ上げる
+        - 戦術への対策（tactics.danger_multiplier）: 相手がよく和了る種類の牌は上げる
+        """
         cfg = self.config["discard"]
-        if kind in opponent_discard_kinds:
+        if kind in dctx.opponent_discard_kinds:
             return 0.0
-        if self._impossible_wait(kind, held_exposed, complete_suits):
+        if self._impossible_wait(kind, dctx.held_exposed, obs.opponent.complete_suits):
             return 0.0
+        if cfg["danger_model"] == "shape":
+            danger = self._shape_danger(kind, dctx)
+        else:
+            danger = self._table_danger(kind, dctx)
+        if kind in dctx.seen_by_opponent:
+            danger *= 1 + cfg["weight_seen_by_opponent"]
+        return danger * danger_multiplier(kind, obs.opponent_profile, self.config["tactics"])
 
+    def _shape_danger(self, kind: int, dctx: _DangerContext) -> float:
+        """
+        待ちの形ごとに、相手が kind で和了れる形を手牌に持っている見込みを足す（shape_scale で割って目安を 1 にする）。
+        - 単騎: kind を 1 枚（和了ると放銃した側の損失が 2 倍なので、重みを大きくする）
+        - 双碰: kind を 2 枚
+        - 両面・嵌張・辺張（数牌だけ）: 隣の 2 枚。字牌は順子にならないので、この分だけ安全
+          筋: 両面の反対側の牌を相手が捨てていれば、その両面の見込みを suji_factor 倍に下げる
+          （フリテンは捨てた牌の種類だけなので、両面の片側を捨てても、もう片側では和了れる。弱めに効かせる）
+        """
+        cfg = self.config["discard"]
+        weights = cfg["shape_weights"]
+        one, two = dctx.hold_one, dctx.hold_two
+        danger = weights["tanki"] * one[kind] + weights["shanpon"] * two[kind]
+        if kind < HONOR_START:
+            number = kind % 9
+            base = kind - number
+            # (手牌に要る 2 枚, 筋の反対側)
+            shapes = ((number - 2, number - 1, number - 3), (number - 1, number + 1, None), (number + 1, number + 2, number + 3))
+            for a, b, other in shapes:
+                if a < 0 or b > 8:
+                    continue
+                term = one[base + a] * one[base + b]
+                if other is not None and 0 <= other <= 8 and base + other in dctx.opponent_discard_kinds:
+                    term *= cfg["suji_factor"]
+                danger += weights["sequence"] * term
+        return danger / cfg["shape_scale"]
+
+    def _table_danger(self, kind: int, dctx: _DangerContext) -> float:
+        """牌種ごとの決まった危険度（よわい）。一九字牌は待ちになりにくいと見る。"""
+        cfg = self.config["discard"]
         if kind >= HONOR_START:
             danger = cfg["danger_honor"]
         else:
@@ -745,13 +886,24 @@ class RuleBrain:
             # 筋: 相手が3つ離れた同じ色の牌を捨てていれば、両面待ちの可能性が下がる
             suit_start = kind - number
             suji = [suit_start + n for n in (number - 3, number + 3) if 0 <= n <= 8]
-            if any(s in opponent_discard_kinds for s in suji):
+            if any(s in dctx.opponent_discard_kinds for s in suji):
                 danger *= cfg["suji_factor"]
 
-        if cfg["weight_exposed_neighbor"] > 0 and held_exposed:
-            nearby = sum(count * self._closeness(kind, exposed) for exposed, count in held_exposed.items())
-            danger *= 1 + cfg["weight_exposed_neighbor"] * in_hand_probability * nearby
+        if cfg["weight_exposed_neighbor"] > 0 and dctx.held_exposed:
+            nearby = sum(count * self._closeness(kind, exposed) for exposed, count in dctx.held_exposed.items())
+            danger *= 1 + cfg["weight_exposed_neighbor"] * dctx.in_hand_probability * nearby
         return danger
+
+    @staticmethod
+    def _voltage_potential(obs: CpuObservation, is_new_kind: bool) -> float:
+        """
+        その種類を捨てた後に見込めるボルテージの倍率。続いていればいまの倍率、切れていれば
+        次に初めての種類を捨てて再開したときの倍率（ボルテージは和了ったときの獲得額に掛かる）。
+        """
+        points, broken, resume = next_voltage(
+            obs.me.voltage_points, obs.me.voltage_broken, obs.me.voltage_resume_points, is_new_kind,
+        )
+        return voltage_multiplier(resume + 1 if broken else points)
 
     @staticmethod
     def _impossible_wait(kind: int, held_exposed: Counter, complete_suits: frozenset[str]) -> bool:
