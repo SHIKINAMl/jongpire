@@ -4,6 +4,7 @@ Render 向けエントリーポイント。
 starlette + uvicorn で起動する。
 HTTP GET/HEAD (ヘルスチェック) と WebSocket (/ws) を同じポートで扱う。
 """
+import logging
 import os
 from contextlib import asynccontextmanager
 
@@ -18,6 +19,11 @@ from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from mahjong_engine.communication.websocket_server import WebSocketGameServer
+
+# ログの出力先（Render のログ）。対局のやりとりの INFO は多すぎるので警告以上だけにし、
+# 記録（データベース）まわりは INFO も出す（「記録用のデータベースに接続しました」など）
+logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.getLogger("mahjong_engine.records").setLevel(logging.INFO)
 
 _game_server = WebSocketGameServer(host="0.0.0.0", port=0)
 _required_token = os.getenv("TOKEN", "")
@@ -79,7 +85,15 @@ def _is_authorized(conn) -> bool:
 
 
 async def health(_request):
-    return JSONResponse({"status": "ok"})
+    """
+    死活確認。記録の保存先の状態（records: postgres / connecting / memory）と、デプロイされている
+    コミット（Render が入れる RENDER_GIT_COMMIT の先頭 7 文字）も返す。秘密の値は出さない。
+    """
+    return JSONResponse({
+        "status": "ok",
+        "records": _game_server.records_status(),
+        "commit": os.getenv("RENDER_GIT_COMMIT", "")[:7],
+    })
 
 
 async def stats(request):

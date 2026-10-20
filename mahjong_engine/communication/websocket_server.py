@@ -229,6 +229,10 @@ class WebSocketGameServer:
 				return_exceptions=True,
 			)
 
+	def records_status(self) -> str:
+		"""記録の保存先の状態（postgres / connecting / memory）。"""
+		return self._records.status
+
 	def get_stats(self) -> Dict[str, Any]:
 		"""メモリリーク調査用の内部状態の件数。"""
 		rss = current_rss_bytes()

@@ -89,6 +89,13 @@ class RecordService:
     def persistent(self) -> bool:
         return self.store.persistent and self._connected.is_set()
 
+    @property
+    def status(self) -> str:
+        """記録の保存先の状態（/healthz に出す）。postgres: つながった / connecting: つながるのを待っている / memory。"""
+        if not self.store.persistent:
+            return "memory"
+        return "postgres" if self._connected.is_set() else "connecting"
+
     # ========== 起動・停止 ==========
 
     def start(self) -> None:
