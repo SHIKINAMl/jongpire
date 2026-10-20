@@ -286,7 +286,7 @@ JOIN match_players cpu ON cpu.match_id = m.id AND cpu.cpu_difficulty IS NOT NULL
 JOIN match_players human ON human.match_id = m.id AND human.cpu_difficulty IS NULL
 WHERE m.finished GROUP BY cpu.cpu_difficulty;
 
--- 局ごとの記録（山・手牌・待ち・捨て牌・掛け金・精算結果）
+-- 局ごとの記録（山・手牌・待ち・捨て牌・掛け金・精算結果・先手・使ったスキル・打牌の順番・ボルテージ）
 SELECT match_id, round_index, data FROM match_rounds WHERE match_id = 123 ORDER BY round_index;
 ```
 
@@ -305,13 +305,49 @@ Python なら `asyncpg` / `psycopg` で `SELECT ... FROM match_rounds` を読み
 ```json
 {
   "round_number": 3, "dora_id": 12, "is_draw": false,
+  "first_player": "C0002",
   "liquidation": {"winner_id": "C0001", "loser_id": "C0002", "han": 7, "multiplier": 1.5, "loser_loss": 4500, "...": "..."},
   "players": [
     {"client_id": "C0001", "wall": [34 枚の牌ID], "hand": [13 枚], "waits": [待ち], "discards": [捨てた順],
-     "bet": 1000, "health": 21500, "cumulative_earned_points": 4500}
+     "bet": 1000, "health": 21500, "cumulative_earned_points": 4500,
+     "voltage": {"points": 4, "broken": false, "multiplier": 1.4},
+     "boost_hand_bonus": {"平和": 1}}
+  ],
+  "events": [
+    {"type": "skill", "player": "CPU0001", "skill": "perspective", "source": "cpu_perk", "cost": 0, "health_after": 20000,
+     "perspective": {"suit": null, "exposed_indexes": [2, 5, 9], "exposed_tiles": [3, 14, 40]}},
+    {"type": "skill", "player": "C0001", "skill": "perspective", "source": "skill", "cost": 500, "health_after": 19500,
+     "perspective": {"suit": "manzu", "exposed_indexes": [0, 7], "exposed_tiles": [1, 6]}},
+    {"type": "skill", "player": "C0001", "skill": "mulligan", "source": "skill", "cost": 500, "health_after": 19000,
+     "mulligan": {"wall_indexes": [1, 2, 3], "options": [出した 3 枚, 候補 3 枚]}},
+    {"type": "mulligan_select", "player": "C0001", "choices": [3, 0, 5],
+     "changes": [{"wall_index": 1, "old_tile": 10, "new_tile": 22}, "..."]},
+    {"type": "skill", "player": "C0001", "skill": "boost_hand", "source": "skill", "cost": 5000, "health_after": 14000,
+     "boost_hand": {"yaku_names": ["平和"]}},
+    {"type": "discard", "player": "C0002", "wall_index": 12, "tile": 30, "voltage_points": 1, "voltage_broken": false},
+    {"type": "discard", "player": "C0001", "wall_index": 4, "tile": 8, "voltage_points": 1, "voltage_broken": false}
   ]
 }
 ```
+
+| 項目 | 中身 |
+|---|---|
+| `first_player` | 先手（打牌フェーズで最初に捨てた人）の `client_id`。打牌まで進まなかった局は `null` |
+| `players[].voltage` | 局の終わりのボルテージ（値・途切れたか・倍率） |
+| `players[].boost_hand_bonus` | その局の時点で役強化している役（対局を通じて持続するので、前の局までの分も入る） |
+| `events` | この局で起きたことを起きた順に並べたもの（配牌の後から局の終わりまで） |
+
+`events` の `type`:
+
+- `skill` … 使ったスキル。`skill` は種類（`perspective` / `mulligan` / `boost_hand` / `assault` / `special_victory` など）、`cost` は払ったコスト、`health_after` は払った後の HP。
+  `source` が `cpu_perk` のものは CPU の特典の初期透視（無料）
+  - 透視: `perspective.suit`（指定した色。特典・色なしは `null`）、`exposed_indexes`（相手の `wall` の位置）、`exposed_tiles`（見えた牌）
+  - マリガン: `mulligan.wall_indexes`（出した位置）、`options`（出した 3 枚 + 候補 3 枚）。選んだ結果は次の `mulligan_select`
+  - 役強化: `boost_hand.yaku_names`（強化した役）
+- `mulligan_select` … マリガンで選んだ番号（`options` の番号）と、入れ替わった牌（`changes`。`old_tile` → `new_tile`）
+- `discard` … 打牌。両者の打牌がこの順番で並ぶ（交互）。`voltage_points` / `voltage_broken` は捨てた後のボルテージ
+
+`players[].discards` は人ごとの捨て牌の順番、`events` の `discard` は両者を合わせた順番（同じ牌が入っている）。
 
 `players[].client_id` は `match_players.client_id` と同じなので、`match_id` と `client_id` で結べば、その席の `player_id`・名前・CPU の難易度が分かる。
 

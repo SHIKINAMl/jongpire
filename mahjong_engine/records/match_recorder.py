@@ -105,13 +105,25 @@ class MatchRecorder:
                 "bet": p.bet,
                 "health": p.health,
                 "cumulative_earned_points": p.cumulative_earned_points,
+                # 局の終わりのボルテージ（打牌ごとの値は events の discard にある）
+                "voltage": {"points": p.voltage_points, "broken": p.voltage_broken,
+                            "multiplier": engine._get_voltage_multiplier(p.voltage_points)},
+                "boost_hand_bonus": dict(p.boost_hand_bonus),  # その局の時点で強化済みの役
             })
+        round_state = engine.state.round_state
+        first = round_state.first_player_index
         self.round_logs.append({
-            "round_number": engine.state.round_state.round_number,
-            "dora_id": engine.state.round_state.dora_id,
+            "round_number": round_state.round_number,
+            "dora_id": round_state.dora_id,
             "is_draw": bool(is_draw),
+            # 先手（打牌フェーズで最初に捨てた人）。打牌まで進まなかった局は None
+            "first_player": (engine.state.players[first].player_id
+                             if first is not None and 0 <= first < len(engine.state.players)
+                             and any(e.get("type") == "discard" for e in engine.round_events) else None),
             "liquidation": dict(liquidation) if liquidation else None,
             "players": players,
+            # この局で起きたこと（起きた順）: スキル・マリガンの選択・打牌（両者の打牌の順番とボルテージ）
+            "events": [dict(e) for e in getattr(engine, "round_events", [])],
         })
 
     @staticmethod

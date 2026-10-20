@@ -167,6 +167,9 @@ class GameEngine:
         self._deal_factory = deal_factory
         # 掛け金を払えずに決着したときの、払えなかったプレイヤー（game_end で知らせる。HP の多い方が払えないこともある）
         self.bet_unpayable_players: list[str] = []
+        # この局で起きたこと（スキル・マリガンの選択・打牌）を起きた順に残す。記録（mahjong_engine/records）が
+        # 局の終わりに読む。配牌のたびに空にする
+        self.round_events: list[dict] = []
         # この局の配牌時に特典で公開した牌（initial_perspective_count を持つプレイヤーの分）
         self._initial_perspective_reveals: list[dict] = []
         # 対局が終わった理由（game_end の victory_method になる）
@@ -271,6 +274,7 @@ class GameEngine:
 
         self.state.round_state.dora_id = deal.dora_id
         self._pending_agari = None
+        self.round_events = []
         self._apply_initial_perspectives()
 
         # 局中に次局の配牌を用意しておき、局開始時にすぐ配れるようにする
@@ -294,6 +298,12 @@ class GameEngine:
                 "player_id": player.player_id,
                 "target_id": target.player_id,
                 "exposed_indexes": exposed,
+            })
+            self.round_events.append({
+                "type": "skill", "player": player.player_id, "skill": SkillType.PERSPECTIVE.value,
+                "source": "cpu_perk", "cost": 0, "health_after": player.health,
+                "perspective": {"suit": None, "exposed_indexes": sorted(exposed),
+                                "exposed_tiles": [target.wall[i] for i in sorted(exposed)]},
             })
 
     def get_initial_perspective_reveals(self) -> list[dict]:
@@ -569,11 +579,38 @@ class GameEngine:
 
         # スキル効果を適用
         exposed_tiles = self._apply_skill_effect(user, skill_type, target, options)
+        self._record_skill_event(user, skill_type, cost, target, options, exposed_tiles)
 
         # コールバック呼び出し
         self._invoke_callback(self.on_skill_casted, user.player_id, skill_type, cost, exposed_tiles)
 
         return cost
+
+    def _record_skill_event(
+        self, user: PlayerState, skill_type: SkillType, cost: int, target: Optional[PlayerState],
+        options: dict, exposed_tiles: dict,
+    ) -> None:
+        """使ったスキルを局の出来事に残す（種類・コストと、透視で見えた牌・マリガンの候補・強化した役）。"""
+        event: dict = {
+            "type": "skill", "player": user.player_id, "skill": skill_type.value, "source": "skill",
+            "cost": cost, "health_after": user.health,
+        }
+        if skill_type == SkillType.PERSPECTIVE:
+            perspective = exposed_tiles.get("__perspective__") or {}
+            indexes = list(perspective.get("new_indexes", []))
+            event["perspective"] = {
+                "suit": perspective.get("suit"),
+                "exposed_indexes": indexes,
+                "exposed_tiles": [target.wall[i] for i in indexes] if target is not None else [],
+            }
+        elif skill_type == SkillType.MULLIGAN:
+            pending = user.pending_mulligan or {}
+            # 選んだ結果は、この後の mulligan_select の出来事に残る
+            event["mulligan"] = {"wall_indexes": list(pending.get("wall_indexes", [])),
+                                 "options": list(pending.get("options", []))}
+        elif skill_type == SkillType.BOOST_HAND:
+            event["boost_hand"] = {"yaku_names": list(options.get("yaku_names") or [])}
+        self.round_events.append(event)
 
     def get_skill_cost(self, player: PlayerState, skill_type: SkillType) -> int:
         """プレイヤーの特典（スキルコストの倍率）を反映したスキルコストを返す。"""
@@ -810,6 +847,10 @@ class GameEngine:
             player.wall[change["wall_index"]] = change["new_tile"]
         self.state.round_state.reserved_tiles.extend(t for i, t in enumerate(options) if i not in choice)
         player.pending_mulligan = None
+        self.round_events.append({
+            "type": "mulligan_select", "player": player.player_id, "choices": list(choice),
+            "changes": [dict(c) for c in changes],
+        })
         return {"changes": changes}
 
     def _apply_voltage_discard(self, player: PlayerState, tile_id: int) -> None:
@@ -861,6 +902,10 @@ class GameEngine:
         discarding_player.discarded_wall_indexes.add(wall_index)
 
         self._apply_voltage_discard(discarding_player, discarded_tile) # ボルテージを適用する
+        self.round_events.append({
+            "type": "discard", "player": player_id, "wall_index": wall_index, "tile": discarded_tile,
+            "voltage_points": discarding_player.voltage_points, "voltage_broken": discarding_player.voltage_broken,
+        })
 
         self._invoke_callback(self.on_discarded, player_id, discarded_tile)
 
