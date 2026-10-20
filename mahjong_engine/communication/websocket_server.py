@@ -5,6 +5,13 @@ WebSocket API サーバー
 1. 接続したプレイヤーを待機キューへ追加
 2. 2人揃ったらマッチ成立
 3. その2人に game_started を通知
+
+記録・ランキング（mahjong_engine/records。DATABASE_URL があれば Postgres に残す）:
+- register … 起動時に ID と秘密の文字列を発行してもらう（ログインなし。WebGL 版は起動のたびに発行し、端末に残さない）
+- identify … 発行済みの ID と秘密の文字列で名乗り直す（起動中に接続が切れて、つなぎ直したとき）
+- set_name … 名乗ったプレイヤーの名前を登録・変更する（ゲーム内の名前登録・名前の変更）
+- ranking  … ランキングの上位と自分の順位を返す
+- my_records … 自分の記録（ランキングの 3 つの値と順位・対局数・勝利数）を返す
 """
 
 import asyncio
@@ -20,6 +27,7 @@ from typing import Any, Dict, List, Optional, Set
 from .game_session import GameSession
 from ..ai.cpu_config import DIFFICULTIES, CpuProfile, create_cpu_profile
 from ..utils.memory import current_rss_bytes, trim_malloc
+from ..records import PlayerIdentity, RecordService, create_record_service
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +65,13 @@ class WebSocketGameServer:
 	# 何回に1回、統計をログへ出すか（既定: 10分ごと）
 	STATS_LOG_EVERY = 10
 
-	def __init__(self, host: str = "127.0.0.1", port: int = 8765, max_players: int = 2):
+	def __init__(
+		self,
+		host: str = "127.0.0.1",
+		port: int = 8765,
+		max_players: int = 2,
+		record_service: Optional[RecordService] = None,
+	):
 		self.host = host
 		self.port = port
 		self.max_players = max_players
@@ -76,6 +90,11 @@ class WebSocketGameServer:
 		self._client_id_by_socket: Dict[Any, str] = {}
 		self._socket_by_client_id: Dict[str, Any] = {}
 		self._client_name: Dict[str, str] = {}
+		# identify で名乗ったプレイヤー（client_id → ID・表示名）
+		self._identity_by_client: Dict[str, PlayerIdentity] = {}
+		# この接続で ID を発行したか（1 つの接続で 1 回まで）
+		self._registered_clients: set = set()
+		self._records = record_service if record_service is not None else create_record_service()
 
 		# マッチング待機キュー（先着順）
 		self._waiting_queue: List[str] = []
@@ -95,6 +114,8 @@ class WebSocketGameServer:
 			available_match_numbers=self._available_match_numbers,
 			send_to_client=self._send_to_client,
 			broadcast_match_members=self._broadcast_match_members,
+			record_service=self._records,
+			identity_of=self._identity_by_client.get,
 		)
 
 	def _compact_for_log(self, payload: Any) -> str:
@@ -153,20 +174,22 @@ class WebSocketGameServer:
 		logger.info("WebSocketGameServer stopped")
 
 	def start_housekeeping(self) -> None:
-		"""放置マッチの掃除とメモリ返却を行う定期タスクを起動する。"""
+		"""放置マッチの掃除とメモリ返却を行う定期タスクと、記録の書き込み（データベース）を起動する。"""
 		if self._housekeeping_task is None or self._housekeeping_task.done():
 			self._housekeeping_task = asyncio.create_task(self._housekeeping_loop())
+		self._records.start()
 
 	async def stop_housekeeping(self) -> None:
 		task = self._housekeeping_task
 		self._housekeeping_task = None
-		if task is None:
-			return
-		task.cancel()
-		try:
-			await task
-		except asyncio.CancelledError:
-			pass
+		if task is not None:
+			task.cancel()
+			try:
+				await task
+			except asyncio.CancelledError:
+				pass
+		# 書き込み待ちの記録を、できるだけ書いてから止める
+		await self._records.stop()
 
 	async def _housekeeping_loop(self) -> None:
 		tick = 0
@@ -186,7 +209,7 @@ class WebSocketGameServer:
 		notifications: List[tuple] = []
 		async with self._lock:
 			for match_id in self._game_session.find_idle_matches(self.MATCH_IDLE_TIMEOUT_SEC):
-				match = self._game_session.cleanup_match_locked(match_id)
+				match = self._game_session.cleanup_match_locked(match_id, reason="idle_timeout")
 				if match is None:
 					continue
 				logger.info("放置マッチを破棄: match_id=%s players=%s", match_id, match.players)
@@ -218,6 +241,9 @@ class WebSocketGameServer:
 			"game_engines": len(self.game_engines),
 			"asyncio_tasks": len(asyncio.all_tasks()),
 			"rss_mb": round(rss / (1024 * 1024), 1) if rss is not None else None,
+			"identified_clients": len(self._identity_by_client),
+			"records_persistent": self._records.persistent,
+			"records_queue": self._records.queue_size(),
 			**self._game_session.get_stats(),
 		}
 
@@ -285,6 +311,8 @@ class WebSocketGameServer:
 			self._connections.discard(websocket)
 			self._socket_by_client_id.pop(client_id, None)
 			self._client_name.pop(client_id, None)
+			self._identity_by_client.pop(client_id, None)
+			self._registered_clients.discard(client_id)
 
 			# 待機キューから除外
 			if client_id in self._waiting_queue:
@@ -297,7 +325,7 @@ class WebSocketGameServer:
 
 			# 対局中マッチから除外（エンジン・タスク・確認状態もまとめて破棄）
 			match_id = self._active_match_by_client.pop(client_id, None)
-			match = self._game_session.cleanup_match_locked(match_id) if match_id else None
+			match = self._game_session.cleanup_match_locked(match_id, reason="player_disconnected") if match_id else None
 			if match is not None:
 				other_players = [cid for cid in match.players if cid != client_id]
 
@@ -330,7 +358,7 @@ class WebSocketGameServer:
 	async def _handle_message(self, websocket, raw_message: str) -> None:
 		"""クライアントからのメッセージを処理する"""
 		client_id = self._client_id_for_ws(websocket)
-		logger.info("ws recv client=%s payload=%s", client_id, self._compact_for_log(raw_message))
+		logger.info("ws recv client=%s payload=%s", client_id, self._compact_for_log(self._redact_secret(raw_message)))
 		try:
 			data = json.loads(raw_message)
 		except json.JSONDecodeError:
@@ -364,6 +392,36 @@ class WebSocketGameServer:
 				await self._handle_join_request(client_id, data.get("data"))
 			return
 
+		if msg_type == "register":
+			client_id = self._client_id_by_socket.get(websocket)
+			if client_id:
+				await self._handle_register(client_id)
+			return
+
+		if msg_type == "identify":
+			client_id = self._client_id_by_socket.get(websocket)
+			if client_id:
+				await self._handle_identify(client_id, data.get("data"))
+			return
+
+		if msg_type == "set_name":
+			client_id = self._client_id_by_socket.get(websocket)
+			if client_id:
+				await self._handle_set_name(client_id, data.get("data"))
+			return
+
+		if msg_type == "ranking":
+			client_id = self._client_id_by_socket.get(websocket)
+			if client_id:
+				await self._handle_ranking(client_id, data.get("data"))
+			return
+
+		if msg_type == "my_records":
+			client_id = self._client_id_by_socket.get(websocket)
+			if client_id:
+				await self._handle_my_records(client_id)
+			return
+
 		if msg_type == "action":
 			client_id = self._client_id_by_socket.get(websocket)
 			if client_id:
@@ -371,6 +429,138 @@ class WebSocketGameServer:
 			return
 
 		await self._send_json(websocket, {"type": "error", "message": f"Unknown type: {msg_type}"})
+
+	@staticmethod
+	def _redact_payload(payload: Any) -> Any:
+		"""ログに出す前に、送るメッセージの秘密の文字列（registered の secret）を伏せる。"""
+		if isinstance(payload, dict) and isinstance(payload.get("data"), dict) and "secret" in payload["data"]:
+			return {**payload, "data": {**payload["data"], "secret": "***"}}
+		return payload
+
+	@staticmethod
+	def _redact_secret(raw_message: str) -> Any:
+		"""ログに出す前に、identify の秘密の文字列を伏せる（Render のログに残さない）。"""
+		if '"secret"' not in raw_message:
+			return raw_message
+		try:
+			data = json.loads(raw_message)
+			if isinstance(data, dict) and isinstance(data.get("data"), dict) and "secret" in data["data"]:
+				data = {**data, "data": {**data["data"], "secret": "***"}}
+				return data
+		except (json.JSONDecodeError, TypeError):
+			pass
+		return "<redacted>"
+
+	def _remember_identity(self, client_id: str, identity: PlayerIdentity) -> None:
+		self._identity_by_client[client_id] = identity
+		if identity.name:
+			self._client_name[client_id] = identity.name
+
+	async def _handle_register(self, client_id: str) -> None:
+		"""
+		新しいプレイヤーの ID と秘密の文字列を発行する（クライアントの起動時。名前はまだない）。
+		返す: registered {player_id, secret, persistent}。この接続はそのまま名乗ったことになる。
+		1 つの接続で発行できるのは 1 回だけ（何度も送られても、プレイヤーを増やさない）。
+		"""
+		if client_id in self._registered_clients:
+			await self._send_to_client(client_id, {"type": "register_failed", "data": {"reason": "already_registered"}})
+			return
+		self._registered_clients.add(client_id)
+		result = await self._records.register()
+		if client_id not in self._socket_by_client_id:
+			return  # 登録している間に切断した
+		self._remember_identity(client_id, result.identity)
+		await self._send_to_client(client_id, {
+			"type": "registered",
+			"data": {
+				"player_id": result.identity.player_id,
+				"secret": result.secret,  # 端末に保存してもらう。サーバーはハッシュだけを持つ（ログでは伏せる）
+				"persistent": result.persistent,  # False なら、この ID はデータベースに残っていない
+			},
+		})
+
+	async def _handle_identify(self, client_id: str, payload: Any) -> None:
+		"""
+		発行済みの ID で名乗る。data: {"player_id": UUID, "secret": 発行された文字列, "name": 省略可}
+		成功: identified {player_id, name（未登録なら null）, persistent}、失敗: identify_failed {reason}
+		reason: invalid_player_id / invalid_secret / unknown_player（ID がない → register し直す）/
+		        secret_mismatch（別の秘密の文字列 → register し直す）/ invalid_name / unavailable
+		"""
+		data = payload if isinstance(payload, dict) else {}
+		result = await self._records.identify(data.get("player_id"), data.get("secret"), data.get("name"))
+		if result.identity is None:
+			await self._send_to_client(client_id, {"type": "identify_failed", "data": {"reason": result.error}})
+			return
+		if client_id not in self._socket_by_client_id:
+			return  # 確かめている間に切断した
+		self._remember_identity(client_id, result.identity)
+		await self._send_to_client(client_id, {
+			"type": "identified",
+			"data": {
+				"player_id": result.identity.player_id,
+				"name": result.identity.name,
+				"persistent": result.persistent,  # False なら記録が残らない（データベースが使えない）
+			},
+		})
+
+	async def _handle_set_name(self, client_id: str, payload: Any) -> None:
+		"""
+		名前の登録・変更。register か identify で名乗った接続から送る。data: {"name": 1〜10 文字}
+		成功: name_set {player_id, name}、失敗: set_name_failed {reason}
+		reason: not_identified（先に register / identify）/ invalid_name / unavailable（データベースが使えない）
+		"""
+		identity = self._identity_by_client.get(client_id)
+		if identity is None:
+			await self._send_to_client(client_id, {"type": "set_name_failed", "data": {"reason": "not_identified"}})
+			return
+		data = payload if isinstance(payload, dict) else {}
+		updated, error = await self._records.set_name(identity, data.get("name"))
+		if updated is None:
+			await self._send_to_client(client_id, {"type": "set_name_failed", "data": {"reason": error}})
+			return
+		if client_id not in self._socket_by_client_id:
+			return
+		self._remember_identity(client_id, updated)
+		await self._send_to_client(client_id, {
+			"type": "name_set",
+			"data": {"player_id": updated.player_id, "name": updated.name},
+		})
+
+	async def _handle_ranking(self, client_id: str, payload: Any) -> None:
+		"""
+		ランキング。data: {"kind": "max_damage" | "match_points" | "rounds", "limit": 1〜50}
+		返す: ranking {kind, entries: [{rank, name, value}], me: {rank, value} | null}
+		"""
+		data = payload if isinstance(payload, dict) else {}
+		identity = self._identity_by_client.get(client_id)
+		player_id = identity.player_id if identity is not None and identity.verified else None
+		try:
+			result = await self._records.ranking(data.get("kind"), data.get("limit", 10), player_id)
+		except ValueError as exc:
+			await self._send_to_client(client_id, {"type": "error", "message": str(exc)})
+			return
+		except Exception:
+			logger.exception("ランキングを読めませんでした")
+			await self._send_to_client(client_id, {"type": "error", "message": "Ranking is unavailable"})
+			return
+		await self._send_to_client(client_id, {"type": "ranking", "data": result})
+
+	async def _handle_my_records(self, client_id: str) -> None:
+		"""
+		自分の記録。identify で名乗った後に送る。
+		返す: my_records {matches, wins, max_damage: {value, rank}, match_points: {...}, rounds: {...}}
+		"""
+		identity = self._identity_by_client.get(client_id)
+		if identity is None or not identity.verified:
+			await self._send_to_client(client_id, {"type": "error", "message": "Identify first"})
+			return
+		try:
+			result = await self._records.my_records(identity.player_id)
+		except Exception:
+			logger.exception("自分の記録を読めませんでした")
+			await self._send_to_client(client_id, {"type": "error", "message": "Records are unavailable"})
+			return
+		await self._send_to_client(client_id, {"type": "my_records", "data": result})
 
 	def _normalize_join_payload(self, payload: Any) -> Dict[str, Any]:
 		if isinstance(payload, dict):
@@ -675,7 +865,7 @@ class WebSocketGameServer:
 		if websocket is None:
 			return
 		client_id = self._client_id_for_ws(websocket)
-		logger.info("ws send client=%s payload=%s", client_id, self._compact_for_log(payload))
+		logger.info("ws send client=%s payload=%s", client_id, self._compact_for_log(self._redact_payload(payload)))
 		try:
 			await websocket.send(json.dumps(payload, ensure_ascii=False))
 		except Exception:

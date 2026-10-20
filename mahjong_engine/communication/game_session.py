@@ -9,6 +9,7 @@ from ..engine.game_engine import GameEngine
 from ..engine.game_state import RoundStatus, SkillType, PlayerState
 from ..engine.hand_analyzer import HandAnalyzer
 from ..ai.cpu_controller import CpuController
+from ..records import MatchRecorder, PlayerIdentity, RecordService, Seat
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,8 @@ class GameSession:
 		available_match_numbers: List[int],
 		send_to_client: Callable[[str, Dict[str, Any]], Awaitable[None]],
 		broadcast_match_members: Callable[[str, Dict[str, Any]], Awaitable[None]],
+		record_service: Optional[RecordService] = None,
+		identity_of: Optional[Callable[[str], Optional[PlayerIdentity]]] = None,
 	):
 		self._lock = lock
 		self._matches = matches
@@ -41,6 +44,10 @@ class GameSession:
 		self._last_activity_by_match: Dict[str, float] = {}
 		# CPU の席（client_id → CpuController）。CPU 宛ての通知は WebSocket ではなくここへ渡す
 		self._cpu_controllers: Dict[str, CpuController] = {}
+		# 対局の記録（ランキング・学習用）。record_service がなければ記録しない
+		self._record_service = record_service
+		self._identity_of = identity_of or (lambda _cid: None)
+		self._recorders: Dict[str, MatchRecorder] = {}
 
 	async def _send_error(self, client_id: str, message: str) -> None:
 		"""クライアントへのエラー通知"""
@@ -203,16 +210,20 @@ class GameSession:
 		threshold = time.monotonic() - idle_seconds
 		return [mid for mid, last in self._last_activity_by_match.items() if last < threshold]
 
-	def cleanup_match_locked(self, match_id: str) -> Optional[Any]:
+	def cleanup_match_locked(self, match_id: str, reason: str = "cancelled") -> Optional[Any]:
 		"""
 		マッチに関する状態をすべて破棄する。self._lock を保持した状態で呼ぶこと。
 		正常終了・切断・放置のどの経路からも、この関数でだけ片付ける。
+		決着の前に破棄したとき（切断・放置）は、途中までの記録を reason 付きで残す（ランキングには入れない）。
 
 		Returns:
 			破棄したマッチ（既に破棄済みなら None）
 		"""
 		match = self._matches.pop(match_id, None)
 		engine = self._game_engines.pop(match_id, None)
+		recorder = self._recorders.pop(match_id, None)
+		if recorder is not None and not recorder.finished:
+			self._submit_record(recorder, engine, finished=False, reason=reason)
 		if engine is not None:
 			engine.dispose()
 		self._confirmed_hand_players_by_match.pop(match_id, None)
@@ -238,6 +249,25 @@ class GameSession:
 				self._active_match_by_client.pop(player_id, None)
 
 		return match
+
+	def _submit_record(self, recorder: MatchRecorder, engine: Optional[GameEngine], finished: bool, reason: Optional[str] = None) -> None:
+		"""対局の記録を作り、書き込み待ちに入れる（書き込みは RecordService が別のタスクで行う）。"""
+		if self._record_service is None:
+			return
+		try:
+			self._record_service.submit(recorder.build(engine, finished, reason))
+		except Exception:
+			logger.exception("対局の記録を作れませんでした")
+
+	def _record_round_end(self, match_id: str, engine: GameEngine, is_draw: bool) -> None:
+		"""局の終わりの状態を記録する。次の局の準備で消える前に、エンジンのコールバックの中で同期的に呼ぶ。"""
+		recorder = self._recorders.get(match_id)
+		if recorder is None:
+			return
+		try:
+			recorder.record_round(engine, is_draw)
+		except Exception:
+			logger.exception("局の記録を作れませんでした: match_id=%s", match_id)
 
 	def get_stats(self) -> Dict[str, int]:
 		return {
@@ -325,7 +355,13 @@ class GameSession:
 			self._spawn(match.match_id, _wait_and_start_deal())
 
 		engine.on_round_start = _on_round_start
-		engine.on_round_end = self._create_task_callback(self.on_round_end, match.match_id)
+		notify_round_end = self._create_task_callback(self.on_round_end, match.match_id)
+
+		def _on_round_end(is_draw: bool = False) -> None:
+			self._record_round_end(match.match_id, engine, is_draw)
+			notify_round_end(is_draw)
+
+		engine.on_round_end = _on_round_end
 		engine.on_game_end = self._create_task_callback(self.on_game_end, match.match_id)
 		engine.on_special_victory_won = self._create_task_callback(self.on_special_victory_won, match.match_id)
 
@@ -342,6 +378,13 @@ class GameSession:
 		engine.on_phase_change = _on_phase_change
 		engine._deal_tiles = lambda: None
 
+		# 名乗った人間の ID・表示名（CPU と名乗っていない人間は None）
+		identities = {cid: (None if cid in cpu_profiles else self._identity_of(cid)) for cid in match.players}
+		recorder = MatchRecorder(match.mode, [
+			Seat(cid, identities[cid], cpu_profiles[cid].difficulty if cid in cpu_profiles else None)
+			for cid in match.players
+		])
+
 		payload = {
 			"type": "game_started",
 			"data": {
@@ -352,6 +395,7 @@ class GameSession:
 						"client_id": cid,
 						"health": engine.state.players[idx].health,
 						"is_cpu": cid in cpu_profiles,
+						"name": identities[cid].name if identities[cid] is not None else None,
 						**({"cpu": cpu_profiles[cid].to_public_dict()} if cid in cpu_profiles else {}),
 					}
 					for idx, cid in enumerate(match.players)
@@ -372,6 +416,7 @@ class GameSession:
 				return
 			self._game_engines[match.match_id] = engine
 			self._last_activity_by_match[match.match_id] = time.monotonic()
+			self._recorders[match.match_id] = recorder
 		logger.info("マッチ開始: match_id=%s  players=%s", match.match_id, match.players)
 
 		opening_boosts = engine.assign_random_opening_boosts()
@@ -1285,6 +1330,10 @@ class GameSession:
 					"victory_method": victory_method,
 				},
 			)
+
+			recorder = self._recorders.pop(match_id, None)
+			if recorder is not None:
+				self._submit_record(recorder, engine, finished=True)
 
 			async with self._lock:
 				self.cleanup_match_locked(match_id)

@@ -3,3 +3,5 @@ starlette>=0.40.0
 uvicorn>=0.30.0
 # used by the hard CPU model (mahjong_engine/ai/model_brain.py)
 numpy>=1.26
+# used to save match records and rankings (mahjong_engine/records). Only needed when DATABASE_URL is set
+asyncpg>=0.30

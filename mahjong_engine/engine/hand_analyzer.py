@@ -1105,9 +1105,12 @@ class HandAnalyzer:
 
     @staticmethod
     def _is_ryanpeikou(melds: List[Tuple[str, int]]) -> bool:
-        """二盃口かどうかの判定"""
+        """
+        二盃口かどうかの判定。同じ順子の組（2 つで 1 組）が 2 組あれば二盃口。
+        同じ順子が 4 つ（例: 123萬×4）も 2 組なので二盃口（種類の数で数えると 1 種類になり、一盃口と誤る）。
+        """
         run_counts = Counter(start for kind, start in melds if kind == "run")
-        return sum(count >= 2 for count in run_counts.values()) >= 2
+        return sum(count // 2 for count in run_counts.values()) >= 2
 
     @staticmethod
     def _is_ton(melds: List[Tuple[str, int]]) -> bool:
